@@ -16,7 +16,14 @@ const MONTHS = [
   { value: 12, label: 'Декабрь' },
 ];
 
-function BreakdownTable({ title, data }) {
+const SEVERITY_LABELS = {
+  low: 'Низкая',
+  medium: 'Средняя',
+  high: 'Высокая',
+  critical: 'Критическая',
+};
+
+function BreakdownTable({ title, data, labels }) {
   const entries = Object.entries(data || {});
   return (
     <div className="card">
@@ -37,7 +44,7 @@ function BreakdownTable({ title, data }) {
             <tbody>
               {entries.map(([key, count]) => (
                 <tr key={key}>
-                  <td>{key}</td>
+                  <td>{(labels && labels[key]) || key}</td>
                   <td style={{ textAlign: 'right', fontWeight: 600 }}>{count}</td>
                 </tr>
               ))}
@@ -144,7 +151,7 @@ export default function ReportPage() {
               <BreakdownTable title="По типам" data={report.by_incident_type} />
               <BreakdownTable title="По статусам" data={report.by_status} />
               <BreakdownTable title="По итогам проверки" data={report.by_outcome} />
-              <BreakdownTable title="По важности" data={report.by_severity} />
+              <BreakdownTable title="По важности" data={report.by_severity} labels={SEVERITY_LABELS} />
             </div>
           </>
         )

@@ -9,8 +9,8 @@ const PRESETS = [
       sender: 'ksc-server@corp.local',
       computer: 'WS-FIN-04',
       employee: 'Иванова М.А.',
-      incident_type: 'Вредоносное ПО',
-      severity: 'Высокая',
+      incident_type: 'Вирус / Вредоносное ПО',
+      severity: 'high',
       incident_key: 'ksc-ws-fin-04-trojan',
       has_personal_data: true,
       body: 'Обнаружен и заблокирован объект Trojan.Win32.Agent в каталоге Загрузки пользователя.',
@@ -24,7 +24,7 @@ const PRESETS = [
       computer: 'SRV-DB-01',
       employee: '',
       incident_type: 'Сбой / Доступность',
-      severity: 'Критическая',
+      severity: 'critical',
       incident_key: 'zbx-srv-db-01-high-load',
       has_personal_data: false,
       body: 'Аномальная загрузка CPU (98%) и всплеск сетевых соединений на SRV-DB-01.',
@@ -38,7 +38,7 @@ const PRESETS = [
       computer: 'WS-HR-12',
       employee: 'Петров С.В.',
       incident_type: 'Фишинг',
-      severity: 'Средняя',
+      severity: 'medium',
       incident_key: 'mail-phish-hr-12',
       has_personal_data: true,
       body: 'Сотрудник переслал подозрительное письмо с вложением Счет_оплата.html и запросом пароля.',
@@ -51,8 +51,8 @@ const PRESETS = [
       sender: '@helpdesk_bot',
       computer: 'WS-SALES-07',
       employee: 'Сидоров К.Н.',
-      incident_type: 'Подозрительная активность',
-      severity: 'Высокая',
+      incident_type: 'Несанкционированный доступ',
+      severity: 'high',
       incident_key: 'tg-sales-07-rdp',
       has_personal_data: false,
       body: 'Зафиксированы множественные неудачные попытки входа по RDP с внешнего адреса.',
@@ -61,16 +61,20 @@ const PRESETS = [
 ];
 
 const INCIDENT_TYPES = [
-  'Вредоносное ПО',
+  'Вирус / Вредоносное ПО',
   'Фишинг',
-  'Подозрительная активность',
+  'Несанкционированный доступ',
   'Утечка ПДн',
-  'Нарушение доступа',
   'Сбой / Доступность',
   'Прочее',
 ];
 
-const SEVERITIES = ['Низкая', 'Средняя', 'Высокая', 'Критическая'];
+const SEVERITIES = [
+  { value: 'low', label: 'Низкая' },
+  { value: 'medium', label: 'Средняя' },
+  { value: 'high', label: 'Высокая' },
+  { value: 'critical', label: 'Критическая' },
+];
 
 export default function SimulatorPage({ onOpenIncident }) {
   const [form, setForm] = useState(PRESETS[0].data);
@@ -221,8 +225,8 @@ export default function SimulatorPage({ onOpenIncident }) {
                 onChange={(e) => updateField('severity', e.target.value)}
               >
                 {SEVERITIES.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
+                  <option key={s.value} value={s.value}>
+                    {s.label}
                   </option>
                 ))}
               </select>

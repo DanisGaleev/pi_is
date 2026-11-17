@@ -211,7 +211,7 @@ export default function App() {
           ) : (
             <IncidentsPage
               user={user}
-              onSelectIncident={(id) => setSelectedIncidentId(id)}
+              onOpenIncident={(id) => setSelectedIncidentId(id)}
             />
           ))}
 
