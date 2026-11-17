@@ -1,6 +1,14 @@
 ﻿$ErrorActionPreference = "Stop"
 
-if (-not (Get-Command cloudflared -ErrorAction SilentlyContinue)) {
+$cloudflared = (Get-Command cloudflared -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -First 1)
+if (-not $cloudflared) {
+    $cloudflared = @(
+        "$env:ProgramFiles\cloudflared\cloudflared.exe",
+        "${env:ProgramFiles(x86)}\cloudflared\cloudflared.exe",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\cloudflared.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+if (-not $cloudflared) {
     Write-Error "cloudflared не найден. Установите: winget install Cloudflare.cloudflared"
 }
 
@@ -10,28 +18,34 @@ if (Test-Path $logFile) { Remove-Item $logFile -Force }
 
 $backend = Start-Process -FilePath "uv" -ArgumentList "run", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000" -WorkingDirectory $root -PassThru -NoNewWindow
 $frontend = Start-Process -FilePath "npm.cmd" -ArgumentList "--prefix", "frontend", "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173" -WorkingDirectory $root -PassThru -NoNewWindow
-$tunnel = Start-Process -FilePath "cloudflared" -ArgumentList "tunnel", "--url", "http://127.0.0.1:5173" -RedirectStandardError $logFile -PassThru -NoNewWindow
+$tunnel = Start-Process -FilePath $cloudflared -ArgumentList "tunnel", "--protocol", "http2", "--url", "http://127.0.0.1:5173" -RedirectStandardError $logFile -PassThru -NoNewWindow
 
 try {
-    Write-Host "Запуск бэкенда, фронтенда и Cloudflare-туннеля..."
+    Write-Host "Запуск бэкенда, фронтенда и Cloudflare-туннеля (HTTP/2)..."
     $url = $null
-    for ($i = 0; $i -lt 40; $i++) {
+    $connected = $false
+    for ($i = 0; $i -lt 60; $i++) {
         Start-Sleep -Milliseconds 500
         if (Test-Path $logFile) {
-            $match = Select-String -Path $logFile -Pattern "https://[a-z0-9-]+\.trycloudflare\.com" -AllMatches | Select-Object -First 1
-            if ($match) {
-                $url = $match.Matches[0].Value
-                break
+            if (-not $url) {
+                $match = Select-String -Path $logFile -Pattern "https://[a-z0-9-]+\.trycloudflare\.com" -AllMatches | Select-Object -First 1
+                if ($match) { $url = $match.Matches[0].Value }
+            }
+            if (Select-String -Path $logFile -Pattern "Registered tunnel connection" -Quiet) {
+                $connected = $true
+                if ($url) { break }
             }
         }
     }
 
     Write-Host ""
     Write-Host "Локально:  http://127.0.0.1:5173"
-    if ($url) {
+    if ($url -and $connected) {
         Write-Host "Публично:  $url" -ForegroundColor Green
+    } elseif ($url) {
+        Write-Host "Публично (ожидание подключения): $url" -ForegroundColor Yellow
     } else {
-        Write-Host "Туннель запускается, смотрите URL в логе: $logFile" -ForegroundColor Yellow
+        Write-Host "Не удалось получить URL туннеля. Лог: $logFile" -ForegroundColor Yellow
     }
     Write-Host "Нажмите Ctrl+C для остановки всех сервисов."
 
