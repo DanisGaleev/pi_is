@@ -9,7 +9,7 @@ $logFile = Join-Path $env:TEMP "cloudflared-pi-is.log"
 if (Test-Path $logFile) { Remove-Item $logFile -Force }
 
 $backend = Start-Process -FilePath "uv" -ArgumentList "run", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000" -WorkingDirectory $root -PassThru -NoNewWindow
-$frontend = Start-Process -FilePath "npm" -ArgumentList "--prefix", "frontend", "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173" -WorkingDirectory $root -PassThru -NoNewWindow
+$frontend = Start-Process -FilePath "npm.cmd" -ArgumentList "--prefix", "frontend", "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173" -WorkingDirectory $root -PassThru -NoNewWindow
 $tunnel = Start-Process -FilePath "cloudflared" -ArgumentList "tunnel", "--url", "http://127.0.0.1:5173" -RedirectStandardError $logFile -PassThru -NoNewWindow
 
 try {
