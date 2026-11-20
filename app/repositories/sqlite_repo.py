@@ -20,6 +20,7 @@ from app.domain.models import (
     User,
 )
 from app.enums import (
+    SEVERITY_WEIGHTS,
     AccessCategory,
     Channel,
     CheckResult,
@@ -619,6 +620,69 @@ class SessionRepository(_BaseRepository):
             conn.commit()
 
 
+DEFAULT_INCIDENT_SORT_BY = "severity"
+DEFAULT_INCIDENT_SORT_ORDER = "desc"
+
+_SEVERITY_WHEN_CLAUSES = " ".join(
+    f"WHEN '{sev.value}' THEN {weight}"
+    for sev, weight in sorted(SEVERITY_WEIGHTS.items(), key=lambda item: item[1], reverse=True)
+)
+_SEVERITY_PRIORITY_SQL = f"CASE LOWER(severity) {_SEVERITY_WHEN_CLAUSES} ELSE 0 END"
+
+_INCIDENT_SORT_EXPRESSIONS: dict[str, str] = {
+    "severity": _SEVERITY_PRIORITY_SQL,
+    "detected_at": "detected_at",
+    "created_at": "created_at",
+    "id": "id",
+}
+
+_SORT_DIRECTIONS: dict[str, str] = {
+    "desc": "DESC",
+    "asc": "ASC",
+}
+
+
+def resolve_incident_sort(
+    sort_by: str | None = DEFAULT_INCIDENT_SORT_BY,
+    sort_order: str | None = DEFAULT_INCIDENT_SORT_ORDER,
+) -> tuple[str, str]:
+    """Validate and normalize incident sort field and direction against allowlists."""
+    field_key = (
+        DEFAULT_INCIDENT_SORT_BY
+        if sort_by is None
+        else (sort_by.strip().lower() if isinstance(sort_by, str) else "")
+    )
+    if field_key not in _INCIDENT_SORT_EXPRESSIONS:
+        allowed_fields = ", ".join(_INCIDENT_SORT_EXPRESSIONS)
+        raise ValueError(f"Недопустимое поле сортировки {sort_by!r}; разрешены: {allowed_fields}")
+
+    order_key = (
+        DEFAULT_INCIDENT_SORT_ORDER
+        if sort_order is None
+        else (sort_order.strip().lower() if isinstance(sort_order, str) else "")
+    )
+    if order_key not in _SORT_DIRECTIONS:
+        allowed_orders = ", ".join(_SORT_DIRECTIONS)
+        raise ValueError(
+            f"Недопустимое направление сортировки {sort_order!r}; разрешены: {allowed_orders}"
+        )
+
+    return field_key, order_key
+
+
+def _build_incident_order_by(
+    sort_by: str | None = DEFAULT_INCIDENT_SORT_BY,
+    sort_order: str | None = DEFAULT_INCIDENT_SORT_ORDER,
+) -> str:
+    """Build a safe SQL ORDER BY clause using allowlisted expressions only."""
+    field_key, order_key = resolve_incident_sort(sort_by, sort_order)
+    expr = _INCIDENT_SORT_EXPRESSIONS[field_key]
+    direction = _SORT_DIRECTIONS[order_key]
+    if field_key == "id":
+        return f"id {direction}"
+    return f"{expr} {direction}, id {direction}"
+
+
 class IncidentRepository(_BaseRepository):
     """Persistence operations for incidents."""
 
@@ -634,8 +698,11 @@ class IncidentRepository(_BaseRepository):
         incident_type: str | None = None,
         status: str | None = None,
         exclude_personal_data: bool = False,
+        sort_by: str | None = DEFAULT_INCIDENT_SORT_BY,
+        sort_order: str | None = DEFAULT_INCIDENT_SORT_ORDER,
     ) -> list[Incident]:
-        """List incidents matching optional search and filter criteria."""
+        """List incidents matching optional search, filter, and sort criteria."""
+        order_by = _build_incident_order_by(sort_by, sort_order)
         clauses: list[str] = []
         params: list[Any] = []
 
@@ -657,7 +724,7 @@ class IncidentRepository(_BaseRepository):
         sql = "SELECT * FROM incidents"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY id DESC"
+        sql += f" ORDER BY {order_by}"
 
         with self.db.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
