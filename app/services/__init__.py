@@ -20,6 +20,7 @@ from app.services.ops import (
     ReportService,
     TaskService,
 )
+from app.services.users import UserService
 
 __all__ = [
     "AccessControlService",
@@ -36,6 +37,7 @@ __all__ = [
     "ServiceError",
     "TaskService",
     "UnauthorizedError",
+    "UserService",
     "ValidationError",
     "coerce_user",
 ]

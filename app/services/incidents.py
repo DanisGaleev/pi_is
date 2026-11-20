@@ -20,6 +20,7 @@ from app.repositories.sqlite_repo import (
     InstructionRepository,
     MessageRepository,
     TaskRepository,
+    UserRepository,
     resolve_incident_sort,
     utc_now,
 )
@@ -30,6 +31,7 @@ from app.services.exceptions import (
     ValidationError,
     coerce_user,
 )
+from app.services.users import enrich_tasks_with_users
 from app.services.validators import require_non_blank, require_non_blank_enum_input
 
 
@@ -370,6 +372,7 @@ class IncidentService:
         task_repo: TaskRepository,
         access_control: AccessControlService,
         ingestion_service: IngestionService,
+        user_repo: UserRepository | None = None,
     ) -> None:
         self.incident_repo = incident_repo
         self.message_repo = message_repo
@@ -378,6 +381,7 @@ class IncidentService:
         self.task_repo = task_repo
         self.access_control = access_control
         self.ingestion_service = ingestion_service
+        self.user_repo = user_repo or UserRepository(task_repo.db)
 
     def list_incidents(
         self,
@@ -436,7 +440,10 @@ class IncidentService:
             }
             for p in self.instruction_repo.list_progress(incident_id)
         ]
-        data["tasks"] = [t.to_dict() for t in self.task_repo.list_by_incident(incident_id)]
+        data["tasks"] = enrich_tasks_with_users(
+            self.task_repo.list_by_incident(incident_id),
+            self.user_repo,
+        )
         return data
 
     def create_incident(

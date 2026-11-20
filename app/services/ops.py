@@ -30,6 +30,7 @@ from app.services.exceptions import (
     ValidationError,
     coerce_user,
 )
+from app.services.users import enrich_tasks_with_users
 from app.services.validators import (
     require_iso_datetime,
     require_non_blank,
@@ -115,6 +116,17 @@ class TaskService:
         self.history_repo = history_repo
         self.access_control = access_control
 
+    def _validate_assignee(self, assigned_to: Any) -> User:
+        """Validate that an explicit assignee ID belongs to an existing active user."""
+        if isinstance(assigned_to, bool) or not isinstance(assigned_to, int):
+            raise ValidationError("Некорректный идентификатор исполнителя")
+        assignee = self.user_repo.get_by_id(assigned_to)
+        if assignee is None:
+            raise NotFoundError("Исполнитель не найден")
+        if not assignee.active:
+            raise ValidationError("Нельзя назначить задачу неактивному пользователю")
+        return assignee
+
     def create_task(
         self,
         user: User | Mapping[str, Any],
@@ -134,8 +146,7 @@ class TaskService:
         title = require_non_blank(data.get("title"), "title")
         description = require_non_blank(data.get("description"), "description")
         assigned_to = require_positive_int(data.get("assigned_to"), "assigned_to")
-        if self.user_repo.get_by_id(assigned_to) is None:
-            raise ValidationError(f"Пользователь с id={assigned_to} не найден")
+        assigned_to = self._validate_assignee(assigned_to).id
         due_date = require_iso_datetime(data.get("due_date"), "due_date")
 
         now = utc_now()
@@ -156,7 +167,7 @@ class TaskService:
             created_at=now,
         )
         self.access_control.log_access(actor.id, "task", task.id, "create")
-        return task.to_dict()
+        return enrich_tasks_with_users([task], self.user_repo)[0]
 
     def list_tasks(
         self,
@@ -177,12 +188,13 @@ class TaskService:
         elif isinstance(assigned_to, str) and assigned_to.isdigit():
             assigned_id = int(assigned_to)
 
-        return self.task_repo.list_filtered_with_meta(
+        rows = self.task_repo.list_filtered_with_meta(
             assigned_to=assigned_id,
             status=status,
             incident_id=incident_id,
             exclude_personal_data=exclude_pdn,
         )
+        return enrich_tasks_with_users(rows, self.user_repo)
 
     def update_task(
         self,
@@ -190,7 +202,7 @@ class TaskService:
         task_id: int,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        """Update task status, result, or due date with PDn RBAC check."""
+        """Update task status, result, assignee, or due date with PDn RBAC check."""
         actor = coerce_user(user)
         found = self.task_repo.get_with_incident_pdn(task_id)
         if found is None:
@@ -211,6 +223,14 @@ class TaskService:
             raise ValidationError("Поле 'result' должно быть строкой")
         if "due_date" in data:
             task.due_date = require_iso_datetime(data["due_date"], "due_date")
+        reassigned = False
+        if "assigned_to" in data:
+            raw_assigned = data["assigned_to"]
+            if raw_assigned is not None:
+                task.assigned_to = self._validate_assignee(raw_assigned).id
+            else:
+                task.assigned_to = None
+            reassigned = True
 
         if raw_status is not None:
             try:
@@ -233,15 +253,22 @@ class TaskService:
                 task.result = raw_result.strip() if raw_result.strip() else ""
 
         updated = self.task_repo.update(task)
+        details_parts = [f"Задача #{task_id}: статус '{updated.status}'"]
+        if reassigned:
+            details_parts.append(
+                f"исполнитель #{updated.assigned_to}"
+                if updated.assigned_to is not None
+                else "исполнитель снят"
+            )
         self.history_repo.add(
             incident_id=updated.incident_id,
             user_id=actor.id,
             action="task_updated",
-            details=f"Задача #{task_id}: статус '{updated.status}'",
+            details=", ".join(details_parts),
             created_at=now,
         )
         self.access_control.log_access(actor.id, "task", task_id, "update")
-        return updated.to_dict()
+        return enrich_tasks_with_users([updated], self.user_repo)[0]
 
     def list_overdue(self, user: User | Mapping[str, Any]) -> list[dict[str, Any]]:
         """Return overdue tasks visible to the user."""
@@ -249,7 +276,8 @@ class TaskService:
         exclude_pdn = not self.access_control.can_create_pdn(actor)
         now_dt = datetime.now(timezone.utc)
         tasks = self.task_repo.list_filtered(exclude_personal_data=exclude_pdn)
-        return [task.to_dict() for task in tasks if task.is_overdue(now_dt)]
+        overdue = [task for task in tasks if task.is_overdue(now_dt)]
+        return enrich_tasks_with_users(overdue, self.user_repo)
 
 
 class DeadlineService:

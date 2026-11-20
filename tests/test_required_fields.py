@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.container import AppContainer
 from app.enums import CheckResult, IncidentStatus, IncidentType, SourceType, TaskStatus
-from app.services.exceptions import ValidationError
+from app.services.exceptions import NotFoundError, ValidationError
 from main import app
 
 
@@ -78,7 +78,7 @@ class TestRequiredFieldsHttp(unittest.TestCase):
             ("zero_assigned_to", {**base, "assigned_to": 0}, 422),
             ("negative_assigned_to", {**base, "assigned_to": -1}, 422),
             ("float_assigned_to", {**base, "assigned_to": 1.5}, 422),
-            ("nonexistent_assigned_to", {**base, "assigned_to": 999999}, 400),
+            ("nonexistent_assigned_to", {**base, "assigned_to": 999999}, 404),
             ("missing_due_date", {k: v for k, v in base.items() if k != "due_date"}, 422),
             ("none_due_date", {**base, "due_date": None}, 422),
             ("empty_due_date", {**base, "due_date": ""}, 422),
@@ -345,7 +345,12 @@ class TestRequiredFieldsService(unittest.TestCase):
         ]
         for bad in invalid_payloads:
             with self.subTest(bad=bad):
-                with self.assertRaises(ValidationError):
+                expected_exc = (
+                    NotFoundError
+                    if bad.get("assigned_to") == 999999
+                    else ValidationError
+                )
+                with self.assertRaises(expected_exc):
                     task_svc.create_task(self.ib, 1, bad)
 
         created = task_svc.create_task(self.ib, 1, base)
