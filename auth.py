@@ -1,17 +1,15 @@
-import hashlib
 import secrets
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
+from app.container import container
+from app.domain.models import User
 from app.enums import Role
-from db import get_conn, utc_now
+from app.repositories.sqlite_repo import hash_password, utc_now
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
-
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
 class LoginRequest(BaseModel):
@@ -19,70 +17,65 @@ class LoginRequest(BaseModel):
     password: str
 
 
-def _parse_role(value: str) -> Role | str:
+def _parse_role(value: Role | str) -> Role | str:
+    if isinstance(value, Role):
+        return value
     try:
         return Role(value)
     except ValueError:
         return value
 
 
-def _user_dict(row) -> dict:
+def _user_dict(user: User | Any) -> dict[str, Any]:
+    if isinstance(user, User):
+        return {
+            "id": user.id,
+            "username": user.username,
+            "full_name": user.full_name,
+            "role": _parse_role(user.role),
+        }
     return {
-        "id": row["id"],
-        "username": row["username"],
-        "full_name": row["full_name"],
-        "role": _parse_role(row["role"]),
+        "id": user["id"],
+        "username": user["username"],
+        "full_name": user["full_name"],
+        "role": _parse_role(user["role"]),
     }
 
 
-def get_current_user(authorization: str | None = Header(default=None)) -> dict:
+def get_current_user(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Требуется авторизация")
     token = authorization.removeprefix("Bearer ").strip()
     if not token:
         raise HTTPException(status_code=401, detail="Неверный токен")
 
-    conn = get_conn()
-    try:
-        row = conn.execute(
-            """
-            SELECT u.id, u.username, u.full_name, u.role
-            FROM sessions s
-            JOIN users u ON u.id = s.user_id
-            WHERE s.token = ?
-            """,
-            (token,),
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if row is None:
+    user = container.session_repo.get_user_by_token(token)
+    if user is None:
         raise HTTPException(status_code=401, detail="Сессия не найдена")
-    return _user_dict(row)
+    return _user_dict(user)
 
 
 @router.post("/login")
-def login(payload: LoginRequest) -> dict:
-    conn = get_conn()
-    try:
-        row = conn.execute(
-            "SELECT id, username, password_hash, full_name, role FROM users WHERE username = ?",
-            (payload.username,),
-        ).fetchone()
-        if row is None or row["password_hash"] != hash_password(payload.password):
-            raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+def login(payload: LoginRequest) -> dict[str, Any]:
+    user = container.auth_provider.authenticate(payload.username, payload.password)
+    if user is None:
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
 
-        token = secrets.token_hex(24)
-        conn.execute(
-            "INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, ?)",
-            (token, row["id"], utc_now()),
-        )
-        conn.commit()
-        return {"token": token, "user": _user_dict(row)}
-    finally:
-        conn.close()
+    token = secrets.token_hex(24)
+    container.session_repo.create(token, user.id, utc_now())
+    return {"token": token, "user": _user_dict(user)}
 
 
 @router.get("/me")
-def me(user: dict = Depends(get_current_user)) -> dict:
+def me(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
     return user
+
+
+__all__ = [
+    "LoginRequest",
+    "get_current_user",
+    "hash_password",
+    "login",
+    "me",
+    "router",
+]
