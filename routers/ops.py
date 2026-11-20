@@ -32,6 +32,10 @@ class RknDraftUpdate(BaseModel):
     rkn_draft: str
 
 
+class RknConfirm(BaseModel):
+    confirmation: str = ""
+
+
 @router.get("/instructions")
 def list_instructions(_user: dict[str, Any] = Depends(get_current_user)) -> list[dict[str, Any]]:
     return call_service(container.instruction_service.list_instructions)
@@ -116,6 +120,20 @@ def update_rkn_draft(
         user,
         incident_id,
         payload.rkn_draft,
+    )
+
+
+@router.post("/incidents/{incident_id}/rkn/confirm")
+def confirm_rkn_sent(
+    incident_id: int,
+    payload: RknConfirm,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    return call_service(
+        container.deadline_service.mark_sent,
+        user,
+        incident_id,
+        payload.confirmation,
     )
 
 

@@ -63,9 +63,15 @@ class InstructionService:
         """Toggle completion state for an instruction step on an incident."""
         actor = coerce_user(user)
         incident = self.incident_repo.get_by_id(incident_id)
+        self.access_control.assert_operational_incident_access(
+            actor,
+            incident,
+            object_type="incident",
+            object_id=incident_id,
+            detail="Обновление шагов инструкции запрещено",
+        )
         if incident is None:
             raise NotFoundError("Инцидент не найден")
-        self.access_control.assert_incident_access(actor, incident, edit=True)
 
         now = utc_now()
         progress = self.instruction_repo.upsert_progress(
@@ -114,9 +120,16 @@ class TaskService:
         """Create a remediation task on an incident, defaulting assignee to sysadmin."""
         actor = coerce_user(user)
         incident = self.incident_repo.get_by_id(incident_id)
+        self.access_control.assert_operational_incident_access(
+            actor,
+            incident,
+            object_type="task",
+            object_id=None,
+            action="create_denied",
+            detail="Создание задач запрещено",
+        )
         if incident is None:
             raise NotFoundError("Инцидент не найден")
-        self.access_control.assert_incident_access(actor, incident, edit=True)
 
         assigned_to = data.get("assigned_to")
         if assigned_to is None:
@@ -152,7 +165,8 @@ class TaskService:
     ) -> list[dict[str, Any]]:
         """List tasks filtered by assignee, status, incident, and PDn access."""
         actor = coerce_user(user)
-        exclude_pdn = not self.access_control.can_create_pdn(actor)
+        self.access_control.assert_task_view_access(actor)
+        exclude_pdn = not self.access_control.can_view_pdn(actor)
 
         assigned_id: int | None = None
         if assigned_to == "me":
@@ -175,14 +189,21 @@ class TaskService:
         task_id: int,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        """Update task status, result, or due date with PDn RBAC check."""
+        """Update task status, result, or due date with RBAC and PDn check."""
         actor = coerce_user(user)
+        self.access_control.assert_operational_access(
+            actor,
+            "task",
+            task_id,
+            action="edit_denied",
+            detail="Изменение задач запрещено",
+        )
         found = self.task_repo.get_with_incident_pdn(task_id)
         if found is None:
             raise NotFoundError("Задача не найдена")
 
         task, has_pd = found
-        if PdnFlag.from_bool_int(has_pd) is PdnFlag.YES and not self.access_control.can_create_pdn(actor):
+        if PdnFlag.from_bool_int(has_pd) is PdnFlag.YES and not self.access_control.can_view_pdn(actor):
             self.access_control.log_access(actor.id, "task", task_id, "access_denied")
             raise AccessDeniedError("Доступ к задачам по инцидентам с ПДн запрещен")
 
@@ -219,7 +240,8 @@ class TaskService:
     def list_overdue(self, user: User | Mapping[str, Any]) -> list[dict[str, Any]]:
         """Return overdue tasks visible to the user."""
         actor = coerce_user(user)
-        exclude_pdn = not self.access_control.can_create_pdn(actor)
+        self.access_control.assert_task_view_access(actor)
+        exclude_pdn = not self.access_control.can_view_pdn(actor)
         now_dt = datetime.now(timezone.utc)
         tasks = self.task_repo.list_filtered(exclude_personal_data=exclude_pdn)
         return [task.to_dict() for task in tasks if task.is_overdue(now_dt)]
@@ -278,18 +300,29 @@ class DeadlineService:
             confirmation=incident.rkn_confirmation,
         )
 
+    def _load_authorized_rkn_incident(
+        self,
+        user: User | Mapping[str, Any],
+        incident_id: int,
+        *,
+        edit: bool = False,
+    ) -> tuple[User, Incident]:
+        actor = coerce_user(user)
+        self.access_control.assert_rkn_access(actor)
+        incident = self.incident_repo.get_by_id(incident_id)
+        if incident is None:
+            raise NotFoundError("Инцидент не найден")
+        self.access_control.assert_rkn_access(actor, incident)
+        self.access_control.assert_incident_access(actor, incident, edit=edit)
+        return actor, incident
+
     def get_notice(
         self,
         user: User | Mapping[str, Any],
         incident_id: int,
     ) -> dict[str, Any]:
         """Compute RKN deadlines and auto-generate or return stored draft notice."""
-        actor = coerce_user(user)
-        self.access_control.assert_rkn_access(actor)
-        incident = self.incident_repo.get_by_id(incident_id)
-        if incident is None:
-            raise NotFoundError("Инцидент не найден")
-        self.access_control.assert_incident_access(actor, incident)
+        actor, incident = self._load_authorized_rkn_incident(user, incident_id, edit=False)
         self.access_control.log_access(actor.id, "regulator_notice", incident_id, "view")
         return self._build_notice(incident).to_dict()
 
@@ -300,12 +333,7 @@ class DeadlineService:
         rkn_draft: str,
     ) -> dict[str, Any]:
         """Persist an edited RKN notification draft."""
-        actor = coerce_user(user)
-        self.access_control.assert_rkn_access(actor)
-        incident = self.incident_repo.get_by_id(incident_id)
-        if incident is None:
-            raise NotFoundError("Инцидент не найден")
-        self.access_control.assert_incident_access(actor, incident, edit=True)
+        actor, incident = self._load_authorized_rkn_incident(user, incident_id, edit=True)
 
         now = utc_now()
         incident.rkn_draft = rkn_draft
@@ -328,12 +356,7 @@ class DeadlineService:
         confirmation: str,
     ) -> dict[str, Any]:
         """Record RKN notice submission confirmation and timestamp."""
-        actor = coerce_user(user)
-        self.access_control.assert_rkn_access(actor)
-        incident = self.incident_repo.get_by_id(incident_id)
-        if incident is None:
-            raise NotFoundError("Инцидент не найден")
-        self.access_control.assert_incident_access(actor, incident, edit=True)
+        actor, incident = self._load_authorized_rkn_incident(user, incident_id, edit=True)
 
         now = utc_now()
         notice = self._build_notice(incident)
