@@ -1,17 +1,18 @@
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, BeforeValidator
 
-from app.enums import Role
+from app.enums import IncidentStatus, PdnFlag, Role, TaskStatus
 from auth import get_current_user
 from db import get_conn, utc_now
 
 router = APIRouter(prefix="/api", tags=["ops"])
 
-DONE_TASK_STATUSES = {"выполнена", "завершена", "закрыта", "done"}
+NormalizedTaskStatus = Annotated[TaskStatus, BeforeValidator(TaskStatus.normalize)]
 
 
 class StepUpdate(BaseModel):
@@ -25,7 +26,7 @@ class TaskCreate(BaseModel):
 
 
 class TaskUpdate(BaseModel):
-    status: str | None = None
+    status: NormalizedTaskStatus | None = None
     result: str | None = None
 
 
@@ -50,7 +51,7 @@ def _get_incident(
     row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Инцидент не найден")
-    if forbid_sysadmin_pdn and user["role"] == Role.SYS_ADMIN and row["has_personal_data"] == 1:
+    if forbid_sysadmin_pdn and user["role"] == Role.SYS_ADMIN and PdnFlag.from_bool_int(row["has_personal_data"]) is PdnFlag.YES:
         raise HTTPException(status_code=403, detail="Доступ к инцидентам с ПДн запрещен")
     return row
 
@@ -70,7 +71,7 @@ def _log_history(
 
 
 def _build_rkn_draft(row: sqlite3.Row, deadline_24h: datetime, deadline_72h: datetime) -> str:
-    pdn_flag = "Да" if row["has_personal_data"] == 1 else "Нет"
+    pdn_flag = "Да" if PdnFlag.from_bool_int(row["has_personal_data"]) is PdnFlag.YES else "Нет"
     return (
         f"УВЕДОМЛЕНИЕ В РОСКОМНАДЗОР (первичное / 24 часа)\n"
         f"Инцидент #{row['id']}: {row['title']}\n"
@@ -191,9 +192,9 @@ def create_task(
         cur = conn.execute(
             """
             INSERT INTO tasks (incident_id, title, description, assigned_to, status, result, created_by, created_at)
-            VALUES (?, ?, ?, ?, 'Открыта', '', ?, ?)
+            VALUES (?, ?, ?, ?, ?, '', ?, ?)
             """,
-            (incident_id, payload.title, payload.description, assigned_to, user["id"], now),
+            (incident_id, payload.title, payload.description, assigned_to, TaskStatus.OPEN.value, user["id"], now),
         )
         task_id = cur.lastrowid
         _log_history(
@@ -234,8 +235,9 @@ def list_tasks(
             params.append(int(assigned_to))
 
         if status:
+            resolved_status = TaskStatus.resolve(status)
             clauses.append("t.status = ?")
-            params.append(status)
+            params.append(resolved_status.value if resolved_status is not None else status)
 
         if incident_id is not None:
             clauses.append("t.incident_id = ?")
@@ -276,15 +278,15 @@ def update_task(
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Задача не найдена")
-        if user["role"] == Role.SYS_ADMIN and row["has_personal_data"] == 1:
+        if user["role"] == Role.SYS_ADMIN and PdnFlag.from_bool_int(row["has_personal_data"]) is PdnFlag.YES:
             raise HTTPException(status_code=403, detail="Доступ к задачам по инцидентам с ПДн запрещен")
 
-        new_status = payload.status if payload.status is not None else row["status"]
+        new_status = payload.status.value if payload.status is not None else row["status"]
         new_result = payload.result if payload.result is not None else row["result"]
         now = utc_now()
 
         if payload.status is not None:
-            if new_status.strip().lower() in DONE_TASK_STATUSES:
+            if TaskStatus.is_done(payload.status):
                 completed_at = row["completed_at"] or now
             else:
                 completed_at = None
@@ -398,13 +400,14 @@ def check_escalations(_user: dict = Depends(get_current_user)) -> list[dict]:
         lawyer_name = users_by_role.get(Role.LAWYER.value, Role.LAWYER.label)
 
         open_incidents = conn.execute(
-            "SELECT * FROM incidents WHERE status != 'Закрыт'"
+            "SELECT * FROM incidents WHERE status != ?",
+            (IncidentStatus.CLOSED.value,),
         ).fetchall()
 
         created: list[dict] = []
         for inc in open_incidents:
             detected_dt = _parse_iso(inc["detected_at"])
-            if inc["taken_at"] is None and inc["status"] == "Новый" and detected_dt < threshold:
+            if inc["taken_at"] is None and inc["status"] == IncidentStatus.NEW and detected_dt < threshold:
                 msg = (
                     f"Эскалация: инцидент #{inc['id']} «{inc['title']}» "
                     f"(критичность: {inc['severity']}) не взят в работу более 30 минут."
@@ -421,7 +424,7 @@ def check_escalations(_user: dict = Depends(get_current_user)) -> list[dict]:
                 if notif:
                     created.append(notif)
 
-            if inc["has_personal_data"] == 1:
+            if PdnFlag.from_bool_int(inc["has_personal_data"]) is PdnFlag.YES:
                 lawyer_msg = (
                     f"Срочно (ПДн): инцидент #{inc['id']} «{inc['title']}» требует правовой оценки "
                     f"и подготовки уведомления в РКН (24ч/72ч)."
@@ -513,7 +516,7 @@ def monthly_report(
             outcome_key = r["outcome"] or "Без итога"
             by_outcome[outcome_key] = by_outcome.get(outcome_key, 0) + 1
             by_severity[r["severity"]] = by_severity.get(r["severity"], 0) + 1
-            if r["has_personal_data"] == 1:
+            if PdnFlag.from_bool_int(r["has_personal_data"]) is PdnFlag.YES:
                 pdn_count += 1
 
         return {
