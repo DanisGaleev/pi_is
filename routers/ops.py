@@ -213,3 +213,12 @@ def monthly_report(
     _user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     return call_service(container.report_service.monthly_report, year=year, month=month)
+
+
+@router.get("/reports/by-type")
+def report_by_type(
+    year: int | None = Query(default=None),
+    month: int | None = Query(default=None, ge=1, le=12),
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    return call_service(container.report_service.by_type_report, year=year, month=month)
