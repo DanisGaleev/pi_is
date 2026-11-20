@@ -174,7 +174,9 @@ class TestRoleAuthAndRbac(unittest.TestCase):
                 "/api/incidents",
                 json={
                     "title": "Утечка файла",
+                    "description": "Выгрузка файла с персональными данными",
                     "incident_type": "Утечка ПДн",
+                    "source": "manual",
                     "has_personal_data": 1,
                 },
                 headers=sys_hdr,
@@ -191,10 +193,15 @@ class TestRoleAuthAndRbac(unittest.TestCase):
         self.assertEqual(self.client.get("/api/incidents/2/rkn", headers=lawyer_hdr).status_code, 200)
         self.assertEqual(self.client.get("/api/incidents/2/rkn", headers=ib_hdr).status_code, 200)
 
-        # Task auto-assignment picks Role.SYS_ADMIN user and hides PDn tasks from sysadmin
+        # Task assignment requires valid user id, description, and due_date; hides PDn tasks from sysadmin
         t_open = self.client.post(
             "/api/incidents/1/tasks",
-            json={"title": "Проверить WS-FIN-04"},
+            json={
+                "title": "Проверить WS-FIN-04",
+                "description": "Провести антивирусную проверку WS-FIN-04",
+                "assigned_to": sys_login["user"]["id"],
+                "due_date": "2026-11-30T12:00:00+00:00",
+            },
             headers=ib_hdr,
         )
         self.assertEqual(t_open.status_code, 200, t_open.text)
@@ -202,7 +209,12 @@ class TestRoleAuthAndRbac(unittest.TestCase):
 
         t_pdn = self.client.post(
             "/api/incidents/2/tasks",
-            json={"title": "Ограничить доступ к CRM"},
+            json={
+                "title": "Ограничить доступ к CRM",
+                "description": "Отозвать токены и заблокировать выгрузку из CRM",
+                "assigned_to": sys_login["user"]["id"],
+                "due_date": "2026-11-30T12:00:00+00:00",
+            },
             headers=ib_hdr,
         )
         self.assertEqual(t_pdn.status_code, 200, t_pdn.text)
