@@ -176,9 +176,11 @@ class TestIncidentSortingApi(unittest.TestCase):
             "/api/incidents",
             json={
                 "title": title,
+                "description": f"Описание: {title}",
                 "incident_type": "virus",
                 "severity": severity,
                 "computer": "WS-API-01",
+                "source": "manual",
                 "has_personal_data": has_personal_data,
                 "detected_at": detected_at,
             },

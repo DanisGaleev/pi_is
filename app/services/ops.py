@@ -24,7 +24,17 @@ from app.repositories.sqlite_repo import (
     utc_now,
 )
 from app.services.access import AccessControlService
-from app.services.exceptions import AccessDeniedError, NotFoundError, ValidationError, coerce_user
+from app.services.exceptions import (
+    AccessDeniedError,
+    NotFoundError,
+    ValidationError,
+    coerce_user,
+)
+from app.services.validators import (
+    require_iso_datetime,
+    require_non_blank,
+    require_positive_int,
+)
 
 
 def _parse_iso(ts: str) -> datetime:
@@ -111,27 +121,32 @@ class TaskService:
         incident_id: int,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        """Create a remediation task on an incident, defaulting assignee to sysadmin."""
+        """Create a remediation task on an incident after validating required fields."""
         actor = coerce_user(user)
         incident = self.incident_repo.get_by_id(incident_id)
         if incident is None:
             raise NotFoundError("Инцидент не найден")
         self.access_control.assert_incident_access(actor, incident, edit=True)
 
-        assigned_to = data.get("assigned_to")
-        if assigned_to is None:
-            sysadmin = self.user_repo.find_first_by_role(Role.SYS_ADMIN)
-            assigned_to = sysadmin.id if sysadmin is not None else None
+        if not isinstance(data, Mapping):
+            raise ValidationError("Данные задачи должны быть словарём")
+
+        title = require_non_blank(data.get("title"), "title")
+        description = require_non_blank(data.get("description"), "description")
+        assigned_to = require_positive_int(data.get("assigned_to"), "assigned_to")
+        if self.user_repo.get_by_id(assigned_to) is None:
+            raise ValidationError(f"Пользователь с id={assigned_to} не найден")
+        due_date = require_iso_datetime(data.get("due_date"), "due_date")
 
         now = utc_now()
         task = self.task_repo.create(
             incident_id=incident_id,
-            title=str(data["title"]),
-            description=str(data.get("description") or ""),
+            title=title,
+            description=description,
             assigned_to=assigned_to,
             created_by=actor.id,
             created_at=now,
-            due_date=data.get("due_date"),
+            due_date=due_date,
         )
         self.history_repo.add(
             incident_id=incident_id,
@@ -186,24 +201,36 @@ class TaskService:
             self.access_control.log_access(actor.id, "task", task_id, "access_denied")
             raise AccessDeniedError("Доступ к задачам по инцидентам с ПДн запрещен")
 
+        if not isinstance(data, Mapping):
+            raise ValidationError("Данные обновления задачи должны быть словарём")
+
         now = utc_now()
         raw_status = data.get("status")
         raw_result = data.get("result")
+        if raw_result is not None and not isinstance(raw_result, str):
+            raise ValidationError("Поле 'result' должно быть строкой")
         if "due_date" in data:
-            task.due_date = data["due_date"]
+            task.due_date = require_iso_datetime(data["due_date"], "due_date")
 
         if raw_status is not None:
-            norm_status = TaskStatus.normalize(raw_status)
+            try:
+                norm_status = TaskStatus.normalize(raw_status)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
             if TaskStatus.is_done(norm_status):
-                res_val = str(raw_result) if raw_result is not None else task.result
-                task.complete(res_val, task.completed_at or now)
+                res_val = raw_result if raw_result is not None else task.result
+                clean_result = require_non_blank(res_val, "result")
+                task.complete(clean_result, task.completed_at or now)
             else:
                 task.status = norm_status.value
                 task.completed_at = None
                 if raw_result is not None:
-                    task.result = str(raw_result)
+                    task.result = raw_result.strip() if raw_result.strip() else ""
         elif raw_result is not None:
-            task.result = str(raw_result)
+            if TaskStatus.is_done(task.status):
+                task.result = require_non_blank(raw_result, "result")
+            else:
+                task.result = raw_result.strip() if raw_result.strip() else ""
 
         updated = self.task_repo.update(task)
         self.history_repo.add(

@@ -802,6 +802,7 @@ class TestServicesViaAppContainer(unittest.TestCase):
                 "description": "Проверка",
                 "incident_type": "bruteforce",
                 "severity": "medium",
+                "source": "manual",
                 "computer": "SRV-AUTH-1",
                 "employee": "",
                 "has_personal_data": 0,
@@ -863,9 +864,36 @@ class TestServicesViaAppContainer(unittest.TestCase):
         # Tasks & overdue filtering
         past_due = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
         future_due = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
-        t1 = task_svc.create_task(self.ib, inc_id, {"title": "Просроченная", "due_date": past_due})
-        t2 = task_svc.create_task(self.ib, inc_id, {"title": "Плановая", "due_date": future_due})
-        t_pdn = task_svc.create_task(self.ib, 2, {"title": "ПДн-задача", "due_date": past_due})
+        t1 = task_svc.create_task(
+            self.ib,
+            inc_id,
+            {
+                "title": "Просроченная",
+                "description": "Проверить журнал авторизации",
+                "assigned_to": self.sysadmin.id,
+                "due_date": past_due,
+            },
+        )
+        t2 = task_svc.create_task(
+            self.ib,
+            inc_id,
+            {
+                "title": "Плановая",
+                "description": "Обновить политику паролей",
+                "assigned_to": self.sysadmin.id,
+                "due_date": future_due,
+            },
+        )
+        t_pdn = task_svc.create_task(
+            self.ib,
+            2,
+            {
+                "title": "ПДн-задача",
+                "description": "Проверить доступ к ПДн",
+                "assigned_to": self.sysadmin.id,
+                "due_date": past_due,
+            },
+        )
 
         self.assertEqual(t1["assigned_to"], self.sysadmin.id)
         sys_tasks = task_svc.list_tasks(self.sysadmin, assigned_to="me")

@@ -278,6 +278,7 @@ class TestApiEndpointsWithIncidentEnums(unittest.TestCase):
             "/api/incidents",
             json={
                 "title": "Обнаружен вирус на сервере",
+                "description": "Срабатывание антивируса на SRV-APP-01",
                 "incident_type": "virus",
                 "severity": "Высокий",
                 "source": "kaspersky",
@@ -381,9 +382,15 @@ class TestApiEndpointsWithIncidentEnums(unittest.TestCase):
         self.assertEqual(z_card["incident_type"], IncidentType.OTHER.value)
         self.assertEqual(z_card["source"], SourceType.ZABBIX.value)
 
+        sys_id = self.client.get("/api/auth/me", headers=self._login("sysadmin")).json()["id"]
         task_resp = self.client.post(
             f"/api/incidents/{inc_id}/tasks",
-            json={"title": "Проверить SSH логи"},
+            json={
+                "title": "Проверить SSH логи",
+                "description": "Собрать и проанализировать auth.log на SRV-SSH-01",
+                "assigned_to": sys_id,
+                "due_date": "2026-11-30T12:00:00+00:00",
+            },
             headers=ib_hdr,
         )
         self.assertEqual(task_resp.status_code, 200, task_resp.text)
