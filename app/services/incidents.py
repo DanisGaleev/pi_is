@@ -299,7 +299,7 @@ class IngestionService:
         data: dict[str, Any],
         user: User | Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Create an incident manually after checking PDn permissions."""
+        """Create an incident manually after checking RBAC and PDn permissions."""
         actor = coerce_user(user)
         if not isinstance(data, Mapping):
             raise ValidationError("Данные инцидента должны быть словарём")
@@ -308,9 +308,10 @@ class IngestionService:
             has_pd = PdnFlag.from_bool_int(data.get("has_personal_data", 0)).to_bool_int()
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
-        if has_pd and not self.access_control.can_create_pdn(actor):
-            self.access_control.log_access(actor.id, "incident", None, "create_denied")
-            raise AccessDeniedError("Доступ к инцидентам с ПДн запрещен")
+        self.access_control.assert_create_incident_access(
+            actor,
+            has_personal_data=bool(has_pd),
+        )
 
         title = require_non_blank(data.get("title"), "title")
         description = require_non_blank(data.get("description"), "description")
@@ -403,7 +404,7 @@ class IncidentService:
             q=q,
             incident_type=incident_type,
             status=status,
-            exclude_personal_data=not self.access_control.can_create_pdn(actor),
+            exclude_personal_data=not self.access_control.can_view_pdn(actor),
             sort_by=norm_sort_by,
             sort_order=norm_sort_order,
         )
@@ -465,7 +466,7 @@ class IncidentService:
         incident = self.incident_repo.get_by_id(incident_id)
         if incident is None:
             raise NotFoundError("Инцидент не найден")
-        self.access_control.assert_incident_access(actor, incident, edit=True)
+        self.access_control.assert_incident_fields_editable(actor, incident, data.keys())
 
         changed_fields: list[str] = []
         if data.get("title") is not None:
@@ -482,7 +483,7 @@ class IncidentService:
             changed_fields.append("severity")
         if "has_personal_data" in data and data["has_personal_data"] is not None:
             pdn = PdnFlag.from_bool_int(data["has_personal_data"]).to_bool_int()
-            if pdn and not self.access_control.can_create_pdn(actor):
+            if pdn and not self.access_control.can_mark_pdn(actor):
                 self.access_control.log_access(actor.id, "incident", incident_id, "edit_denied")
                 raise AccessDeniedError("Доступ к инцидентам с ПДн запрещен")
             incident.has_personal_data = pdn
@@ -531,9 +532,15 @@ class IncidentService:
         """Transition incident lifecycle status using domain aggregate methods."""
         actor = coerce_user(user)
         incident = self.incident_repo.get_by_id(incident_id)
+        self.access_control.assert_operational_incident_access(
+            actor,
+            incident,
+            object_type="incident",
+            object_id=incident_id,
+            detail="Изменение статуса инцидента запрещено",
+        )
         if incident is None:
             raise NotFoundError("Инцидент не найден")
-        self.access_control.assert_incident_access(actor, incident, edit=True)
 
         old_status = incident.status
         try:
@@ -590,9 +597,15 @@ class IncidentService:
         """Assign normalized incident type and severity classification."""
         actor = coerce_user(user)
         incident = self.incident_repo.get_by_id(incident_id)
+        self.access_control.assert_operational_incident_access(
+            actor,
+            incident,
+            object_type="incident",
+            object_id=incident_id,
+            detail="Классификация инцидента запрещена",
+        )
         if incident is None:
             raise NotFoundError("Инцидент не найден")
-        self.access_control.assert_incident_access(actor, incident, edit=True)
 
         norm_type = IncidentType.normalize(incident_type).value
         norm_sev = Severity.normalize(severity).value

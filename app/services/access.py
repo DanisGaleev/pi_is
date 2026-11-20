@@ -1,10 +1,12 @@
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from app.domain.models import Incident, User
 from app.enums import AccessCategory, PdnFlag, Role
 from app.repositories.sqlite_repo import AuditRepository
 from app.services.exceptions import AccessDeniedError, coerce_user
+
+LAWYER_EDITABLE_FIELDS: frozenset[str] = frozenset({"rkn_draft", "has_personal_data"})
 
 _PDN_VIEW_ROLES: frozenset[Role] = frozenset(
     {
@@ -16,12 +18,28 @@ _PDN_VIEW_ROLES: frozenset[Role] = frozenset(
     }
 )
 
+_PDN_CREATE_ROLES: frozenset[Role] = frozenset(
+    {
+        Role.SECURITY_SPECIALIST,
+        Role.IT_HEAD,
+        Role.DIRECTOR,
+        Role.ACCOUNTANT,
+    }
+)
+
+_PDN_MARK_ROLES: frozenset[Role] = frozenset(
+    {
+        Role.SECURITY_SPECIALIST,
+        Role.IT_HEAD,
+        Role.LAWYER,
+    }
+)
+
 _EMPLOYEE_INCIDENT_VIEW_ROLES: frozenset[Role] = frozenset(
     {
         Role.SECURITY_SPECIALIST,
         Role.SYS_ADMIN,
         Role.IT_HEAD,
-        Role.LAWYER,
         Role.DIRECTOR,
         Role.ACCOUNTANT,
         Role.FOREMAN,
@@ -34,6 +52,14 @@ _EDIT_ROLES: frozenset[Role] = frozenset(
         Role.SYS_ADMIN,
         Role.IT_HEAD,
         Role.LAWYER,
+    }
+)
+
+_OPERATIONAL_EDIT_ROLES: frozenset[Role] = frozenset(
+    {
+        Role.SECURITY_SPECIALIST,
+        Role.SYS_ADMIN,
+        Role.IT_HEAD,
     }
 )
 
@@ -54,7 +80,9 @@ def _incident_category(incident: Incident | Mapping[str, Any]) -> AccessCategory
             return AccessCategory.PERSONAL_DATA
         if incident.access_category:
             try:
-                return AccessCategory(incident.access_category)
+                cat = AccessCategory(incident.access_category)
+                if cat is not AccessCategory.PERSONAL_DATA:
+                    return cat
             except ValueError:
                 pass
         return incident.resolve_access_category()
@@ -91,6 +119,8 @@ class AccessControlService:
         category = _incident_category(incident)
         if category is AccessCategory.PERSONAL_DATA:
             return actor.role in _PDN_VIEW_ROLES
+        if actor.role is Role.LAWYER:
+            return False
         if category is AccessCategory.EMPLOYEE_INVOLVED:
             return actor.role in _EMPLOYEE_INCIDENT_VIEW_ROLES
         return True
@@ -106,10 +136,57 @@ class AccessControlService:
             return False
         return actor.role in _EDIT_ROLES
 
-    def can_create_pdn(self, user: User | Mapping[str, Any]) -> bool:
-        """Return True if the user is permitted to register or mark PDn incidents."""
+    def can_view_pdn(self, user: User | Mapping[str, Any]) -> bool:
+        """Return True if the user is allowed to view PDn incidents and related data."""
         actor = coerce_user(user)
         return actor.active and actor.role in _PDN_VIEW_ROLES
+
+    def can_create_pdn(self, user: User | Mapping[str, Any]) -> bool:
+        """Return True if the user is permitted to register PDn incidents."""
+        actor = coerce_user(user)
+        return actor.active and actor.role in _PDN_CREATE_ROLES
+
+    def can_mark_pdn(self, user: User | Mapping[str, Any]) -> bool:
+        """Return True if the user can mark an accessible incident as containing PDn."""
+        actor = coerce_user(user)
+        return actor.active and actor.role in _PDN_MARK_ROLES
+
+    def can_create_incident(
+        self,
+        user: User | Mapping[str, Any],
+        has_personal_data: bool = False,
+    ) -> bool:
+        """Return True if the user can manually register an incident."""
+        actor = coerce_user(user)
+        if not actor.active or actor.role is Role.LAWYER:
+            return False
+        if has_personal_data:
+            return self.can_create_pdn(actor)
+        return True
+
+    def can_edit_operational(self, user: User | Mapping[str, Any]) -> bool:
+        """Return True if the user may perform operational incident/task actions."""
+        actor = coerce_user(user)
+        return actor.active and actor.role in _OPERATIONAL_EDIT_ROLES
+
+    def can_edit_incident_fields(
+        self,
+        user: User | Mapping[str, Any],
+        incident: Incident | Mapping[str, Any],
+        fields: Iterable[str],
+    ) -> bool:
+        """Return True if the user can update every requested field on the incident."""
+        actor = coerce_user(user)
+        if not self.can_edit(actor, incident):
+            return False
+        if actor.role is Role.LAWYER:
+            return all(field in LAWYER_EDITABLE_FIELDS for field in fields)
+        return True
+
+    def can_access_tasks(self, user: User | Mapping[str, Any]) -> bool:
+        """Return True if the user can list or view operational tasks."""
+        actor = coerce_user(user)
+        return actor.active and actor.role is not Role.LAWYER
 
     def can_access_rkn(self, user: User | Mapping[str, Any]) -> bool:
         """Return True if the user can view or edit Roskomnadzor notices."""
@@ -141,12 +218,108 @@ class AccessControlService:
             self.log_access(actor.id, "incident", inc_id, "edit_denied")
             raise AccessDeniedError("Редактирование инцидента запрещено")
 
-    def assert_rkn_access(self, user: User | Mapping[str, Any]) -> None:
+    def assert_incident_fields_editable(
+        self,
+        user: User | Mapping[str, Any],
+        incident: Incident | Mapping[str, Any],
+        fields: Iterable[str],
+    ) -> None:
+        """Verify base edit permission and field-level edit restrictions (e.g. lawyer)."""
+        actor = coerce_user(user)
+        self.assert_incident_access(actor, incident, edit=True)
+        if actor.role is Role.LAWYER:
+            disallowed = [field for field in fields if field not in LAWYER_EDITABLE_FIELDS]
+            if disallowed:
+                self.log_access(actor.id, "incident", _incident_id(incident), "edit_denied")
+                raise AccessDeniedError(
+                    "Юрист может изменять только правовые поля (rkn_draft, has_personal_data)"
+                )
+
+    def assert_create_incident_access(
+        self,
+        user: User | Mapping[str, Any],
+        *,
+        has_personal_data: bool = False,
+    ) -> None:
+        """Verify manual incident creation permission or log denial and raise AccessDeniedError."""
+        actor = coerce_user(user)
+        if not actor.active or actor.role is Role.LAWYER:
+            self.log_access(actor.id, "incident", None, "create_denied")
+            raise AccessDeniedError("Создание инцидентов запрещено")
+        if has_personal_data and not self.can_create_pdn(actor):
+            self.log_access(actor.id, "incident", None, "create_denied")
+            raise AccessDeniedError("Доступ к инцидентам с ПДн запрещен")
+
+    def assert_operational_access(
+        self,
+        user: User | Mapping[str, Any],
+        object_type: str = "incident",
+        object_id: int | None = None,
+        *,
+        action: str = "edit_denied",
+        detail: str = "Операционное действие запрещено",
+    ) -> None:
+        """Verify operational role permission (status, steps, tasks, classification)."""
+        actor = coerce_user(user)
+        if not self.can_edit_operational(actor):
+            self.log_access(actor.id, object_type, object_id, action)
+            raise AccessDeniedError(detail)
+
+    def assert_operational_incident_access(
+        self,
+        user: User | Mapping[str, Any],
+        incident: Incident | Mapping[str, Any] | None,
+        *,
+        object_type: str = "incident",
+        object_id: int | None = None,
+        action: str = "edit_denied",
+        detail: str = "Операционное действие запрещено",
+    ) -> None:
+        """Verify operational permission on an incident, checking role before 404 leaks."""
+        actor = coerce_user(user)
+        if incident is None:
+            self.assert_operational_access(
+                actor,
+                object_type,
+                object_id,
+                action=action,
+                detail=detail,
+            )
+            return
+        self.assert_incident_access(actor, incident, edit=True)
+        self.assert_operational_access(
+            actor,
+            object_type,
+            object_id,
+            action=action,
+            detail=detail,
+        )
+
+    def assert_task_view_access(self, user: User | Mapping[str, Any]) -> None:
+        """Verify permission to view operational task queues."""
+        actor = coerce_user(user)
+        if not self.can_access_tasks(actor):
+            self.log_access(actor.id, "task", None, "access_denied")
+            raise AccessDeniedError("Доступ к задачам запрещен")
+
+    def assert_rkn_access(
+        self,
+        user: User | Mapping[str, Any],
+        incident: Incident | Mapping[str, Any] | None = None,
+    ) -> None:
         """Verify RKN notice access or log denial and raise AccessDeniedError."""
         actor = coerce_user(user)
+        inc_id = _incident_id(incident) if incident is not None else None
         if not self.can_access_rkn(actor):
-            self.log_access(actor.id, "regulator_notice", None, "access_denied")
+            self.log_access(actor.id, "regulator_notice", inc_id, "access_denied")
             raise AccessDeniedError("Доступ к данным РКН запрещен")
+        if (
+            incident is not None
+            and actor.role is Role.LAWYER
+            and _incident_category(incident) is not AccessCategory.PERSONAL_DATA
+        ):
+            self.log_access(actor.id, "regulator_notice", inc_id, "access_denied")
+            raise AccessDeniedError("Доступ к уведомлениям РКН разрешен только по инцидентам с ПДн")
 
     def log_access(
         self,
