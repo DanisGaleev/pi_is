@@ -1,10 +1,11 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.domain.models import (
@@ -32,6 +33,40 @@ from app.enums import (
     SourceType,
     TaskStatus,
 )
+
+
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _to_utc_iso(text: str) -> str:
+    """Parse an ISO-8601 date/datetime string into a fixed-width UTC ISO-8601 string."""
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(timespec="microseconds")
+
+
+def _iso_utc_key(value: str) -> str:
+    """Normalize a stored timestamp for chronological SQL comparison, falling back safely."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    try:
+        return _to_utc_iso(text)
+    except ValueError:
+        return text
+
+
+def _parse_date_bound(value: str, *, end_of_day: bool) -> str:
+    """Parse a YYYY-MM-DD date or ISO-8601 datetime into a fixed-width UTC ISO bound."""
+    text = value.strip()
+    if end_of_day and _DATE_ONLY_RE.fullmatch(text):
+        day = date.fromisoformat(text)
+        dt = datetime(day.year, day.month, day.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
+        return dt.isoformat(timespec="microseconds")
+    return _to_utc_iso(text)
 
 
 def utc_now() -> str:
@@ -394,6 +429,7 @@ class Database:
             1,
             lambda s: s.casefold() if isinstance(s, str) else s,
         )
+        conn.create_function("iso_utc", 1, _iso_utc_key)
         return conn
 
     @contextmanager
@@ -1359,18 +1395,46 @@ class NotificationRepository(_BaseRepository):
             ).fetchone()
             return _row_to_notification(row)
 
-    def list_all(self, recipient_role: str | None = None) -> list[Notification]:
-        """List notifications, optionally filtered by recipient_role."""
+    def list_all(
+        self,
+        recipient_role: str | None = None,
+        q: str | None = None,
+        kind: str | None = None,
+        incident_id: int | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[Notification]:
+        """List notifications ordered newest first, with optional search and filters."""
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        if recipient_role and recipient_role.strip():
+            clauses.append("recipient_role = ?")
+            params.append(recipient_role.strip())
+        if q and q.strip():
+            clauses.append("(cfold(message) LIKE ? OR cfold(recipient_name) LIKE ?)")
+            like = f"%{q.strip().casefold()}%"
+            params.extend([like, like])
+        if kind and kind.strip():
+            clauses.append("kind = ?")
+            params.append(kind.strip())
+        if incident_id is not None:
+            clauses.append("incident_id = ?")
+            params.append(incident_id)
+        if date_from and date_from.strip():
+            clauses.append("iso_utc(created_at) >= ?")
+            params.append(_parse_date_bound(date_from, end_of_day=False))
+        if date_to and date_to.strip():
+            clauses.append("iso_utc(created_at) <= ?")
+            params.append(_parse_date_bound(date_to, end_of_day=True))
+
+        sql = "SELECT * FROM notifications"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC"
+
         with self.db.connection() as conn:
-            if recipient_role:
-                rows = conn.execute(
-                    "SELECT * FROM notifications WHERE recipient_role = ? ORDER BY id DESC",
-                    (recipient_role,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM notifications ORDER BY id DESC"
-                ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
             return [_row_to_notification(r) for r in rows]
 
 
