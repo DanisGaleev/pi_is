@@ -1,6 +1,6 @@
 import os
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -61,9 +61,16 @@ def run_e2e() -> None:
             print("PASS 1: Signal ingestion & deduplication")
 
             # 2. Instruction steps, tasks, and RBAC
+            sys_user_id = client.get("/api/auth/me", headers=sys_hdr).json()["id"]
+            due_date = (datetime.now(timezone.utc) + timedelta(days=1)).replace(microsecond=0).isoformat()
             t_tech = client.post(
                 f"/api/incidents/{inc_id}/tasks",
-                json={"title": "Изолировать WS-DEV-09", "description": "Отключить от сети"},
+                json={
+                    "title": "Изолировать WS-DEV-09",
+                    "description": "Отключить от сети",
+                    "assigned_to": sys_user_id,
+                    "due_date": due_date,
+                },
                 headers=ib_hdr,
             )
             assert t_tech.status_code == 200, t_tech.text
@@ -71,7 +78,12 @@ def run_e2e() -> None:
 
             t_pdn = client.post(
                 "/api/incidents/2/tasks",
-                json={"title": "Проверить выгрузку ПДн"},
+                json={
+                    "title": "Проверить выгрузку ПДн",
+                    "description": "Проверить журнал выгрузок ПДн",
+                    "assigned_to": sys_user_id,
+                    "due_date": due_date,
+                },
                 headers=ib_hdr,
             )
             assert t_pdn.status_code == 200, t_pdn.text

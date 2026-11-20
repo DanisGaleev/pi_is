@@ -175,7 +175,12 @@ class TestTaskAssigneePickerAndEnrichment(unittest.TestCase):
         # Nonexistent assignee rejected on create (HTTP 404 / NotFoundError)
         missing_create = self.client.post(
             "/api/incidents/1/tasks",
-            json={"title": "Несуществующий исполнитель", "assigned_to": 999999},
+            json={
+                "title": "Несуществующий исполнитель",
+                "description": "Проверка несуществующего исполнителя",
+                "assigned_to": 999999,
+                "due_date": "2026-12-01T12:00:00+00:00",
+            },
             headers=ib_hdr,
         )
         self.assertEqual(missing_create.status_code, 404, missing_create.text)
@@ -183,13 +188,23 @@ class TestTaskAssigneePickerAndEnrichment(unittest.TestCase):
             self.container.task_service.create_task(
                 ib_user,
                 1,
-                {"title": "Direct check", "assigned_to": 999999},
+                {
+                    "title": "Direct check",
+                    "description": "Проверка сервиса",
+                    "assigned_to": 999999,
+                    "due_date": "2026-12-01T12:00:00+00:00",
+                },
             )
 
         # Inactive assignee rejected on create (HTTP 400 / ValidationError)
         inactive_create = self.client.post(
             "/api/incidents/1/tasks",
-            json={"title": "Уволенный исполнитель", "assigned_to": inactive_user.id},
+            json={
+                "title": "Уволенный исполнитель",
+                "description": "Проверка неактивного исполнителя",
+                "assigned_to": inactive_user.id,
+                "due_date": "2026-12-01T12:00:00+00:00",
+            },
             headers=ib_hdr,
         )
         self.assertEqual(inactive_create.status_code, 400, inactive_create.text)
@@ -197,7 +212,12 @@ class TestTaskAssigneePickerAndEnrichment(unittest.TestCase):
             self.container.task_service.create_task(
                 ib_user,
                 1,
-                {"title": "Direct inactive", "assigned_to": inactive_user.id},
+                {
+                    "title": "Direct inactive",
+                    "description": "Проверка сервиса",
+                    "assigned_to": inactive_user.id,
+                    "due_date": "2026-12-01T12:00:00+00:00",
+                },
             )
 
         # Non-integer assigned_to rejected cleanly in service layer
@@ -205,13 +225,23 @@ class TestTaskAssigneePickerAndEnrichment(unittest.TestCase):
             self.container.task_service.create_task(
                 ib_user,
                 1,
-                {"title": "Bad type", "assigned_to": True},
+                {
+                    "title": "Bad type",
+                    "description": "Проверка типа",
+                    "assigned_to": True,
+                    "due_date": "2026-12-01T12:00:00+00:00",
+                },
             )
 
-        # Valid create -> default sysadmin
+        # Valid create with explicit sysadmin
         created = self.client.post(
             "/api/incidents/1/tasks",
-            json={"title": "Проверить логи WS-FIN-04", "description": "Полная проверка"},
+            json={
+                "title": "Проверить логи WS-FIN-04",
+                "description": "Полная проверка",
+                "assigned_to": sys_user.id,
+                "due_date": "2026-12-01T12:00:00+00:00",
+            },
             headers=ib_hdr,
         )
         self.assertEqual(created.status_code, 200, created.text)
@@ -294,6 +324,7 @@ class TestTaskAssigneePickerAndEnrichment(unittest.TestCase):
                 "title": "Изолировать узел",
                 "description": "Отключить от локальной сети",
                 "assigned_to": head_user.id,
+                "due_date": "2026-12-01T12:00:00+00:00",
             },
             headers=ib_hdr,
         )

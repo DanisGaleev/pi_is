@@ -1,7 +1,7 @@
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, BeforeValidator
+from pydantic import BaseModel, BeforeValidator, ValidationInfo, field_validator, model_validator
 
 from app.container import container
 from app.enums import (
@@ -11,7 +11,13 @@ from app.enums import (
     Severity,
     SourceType,
 )
+from app.repositories.sqlite_repo import (
+    DEFAULT_INCIDENT_SORT_BY,
+    DEFAULT_INCIDENT_SORT_ORDER,
+)
+from app.services.exceptions import ValidationError
 from app.services.incidents import normalize_outcome
+from app.services.validators import require_non_blank, require_non_blank_enum_input
 from auth import get_current_user
 from routers import call_service
 
@@ -28,26 +34,43 @@ def _normalize_signal_source(raw: str | SourceType | None) -> str:
     return SourceType.normalize(raw).value
 
 
+def _normalize_required_incident_type(raw: Any) -> IncidentType:
+    checked = require_non_blank_enum_input(raw, IncidentType, "incident_type")
+    return IncidentType.normalize(checked)
+
+
+def _normalize_required_source_type(raw: Any) -> SourceType:
+    checked = require_non_blank_enum_input(raw, SourceType, "source")
+    return SourceType.normalize(checked)
+
+
 NormalizedIncidentType = Annotated[IncidentType, BeforeValidator(IncidentType.normalize)]
+RequiredIncidentType = Annotated[IncidentType, BeforeValidator(_normalize_required_incident_type)]
 NormalizedSeverity = Annotated[Severity, BeforeValidator(Severity.normalize)]
 NormalizedIncidentStatus = Annotated[IncidentStatus, BeforeValidator(IncidentStatus.normalize)]
 NormalizedSourceType = Annotated[SourceType, BeforeValidator(SourceType.normalize)]
+RequiredSourceType = Annotated[SourceType, BeforeValidator(_normalize_required_source_type)]
 SignalSource = Annotated[str, BeforeValidator(_normalize_signal_source)]
 NormalizedOutcome = Annotated[str | None, BeforeValidator(normalize_outcome)]
 
 
 class IncidentCreate(BaseModel):
     title: str
-    description: str = ""
-    incident_type: NormalizedIncidentType
+    description: str
+    incident_type: RequiredIncidentType
     severity: NormalizedSeverity = Severity.MEDIUM
     computer: str = ""
     employee: str = ""
-    source: NormalizedSourceType = SourceType.MANUAL
+    source: RequiredSourceType
     incident_key: str = ""
     has_personal_data: bool | int | PdnFlag = 0
     instruction_id: int | None = None
     detected_at: str | None = None
+
+    @field_validator("title", "description", mode="before")
+    @classmethod
+    def _validate_non_blank(cls, value: Any, info: ValidationInfo) -> str:
+        return require_non_blank(value, info.field_name or "field")
 
 
 class IncidentUpdate(BaseModel):
@@ -64,6 +87,13 @@ class StatusTransition(BaseModel):
     status: NormalizedIncidentStatus
     outcome: NormalizedOutcome = None
 
+    @model_validator(mode="after")
+    def _validate_closed_outcome(self) -> "StatusTransition":
+        if self.status is IncidentStatus.CLOSED:
+            if self.outcome is not None and not self.outcome.strip():
+                raise ValidationError("Для закрытия инцидента поле 'outcome' не может быть пустым")
+        return self
+
 
 class SignalIn(BaseModel):
     source: SignalSource = ""
@@ -77,12 +107,19 @@ class SignalIn(BaseModel):
     has_personal_data: bool | int | PdnFlag = 0
     title: str | None = None
 
+    @field_validator("body", mode="before")
+    @classmethod
+    def _validate_body(cls, value: Any) -> str:
+        return require_non_blank(value, "body")
+
 
 @router.get("/incidents")
 def list_incidents(
     q: str | None = None,
     incident_type: str | None = None,
     status: str | None = None,
+    sort_by: str = DEFAULT_INCIDENT_SORT_BY,
+    sort_order: str = DEFAULT_INCIDENT_SORT_ORDER,
     user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     return call_service(
@@ -91,6 +128,8 @@ def list_incidents(
         q=q,
         incident_type=incident_type,
         status=status,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
 

@@ -1,10 +1,16 @@
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, BeforeValidator
+from pydantic import BaseModel, BeforeValidator, ValidationInfo, field_validator, model_validator
 
 from app.container import container
 from app.enums import TaskStatus
+from app.services.exceptions import ValidationError
+from app.services.validators import (
+    require_iso_datetime,
+    require_non_blank,
+    require_positive_int,
+)
 from auth import get_current_user
 from routers import call_service
 
@@ -19,14 +25,37 @@ class StepUpdate(BaseModel):
 
 class TaskCreate(BaseModel):
     title: str
-    description: str = ""
-    assigned_to: int | None = None
+    description: str
+    assigned_to: int
+    due_date: str
+
+    @field_validator("title", "description", mode="before")
+    @classmethod
+    def _validate_non_blank(cls, value: Any, info: ValidationInfo) -> str:
+        return require_non_blank(value, info.field_name or "field")
+
+    @field_validator("assigned_to", mode="before")
+    @classmethod
+    def _validate_assigned_to(cls, value: Any) -> int:
+        return require_positive_int(value, "assigned_to")
+
+    @field_validator("due_date", mode="before")
+    @classmethod
+    def _validate_due_date(cls, value: Any) -> str:
+        return require_iso_datetime(value, "due_date")
 
 
 class TaskUpdate(BaseModel):
     status: NormalizedTaskStatus | None = None
     result: str | None = None
     assigned_to: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_done_result(self) -> "TaskUpdate":
+        if self.status is not None and TaskStatus.is_done(self.status):
+            if self.result is not None and not self.result.strip():
+                raise ValidationError("Для завершения задачи поле 'result' не может быть пустым")
+        return self
 
 
 class RknDraftUpdate(BaseModel):
@@ -141,11 +170,21 @@ def check_escalations(_user: dict[str, Any] = Depends(get_current_user)) -> list
 @router.get("/notifications")
 def list_notifications(
     recipient_role: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    kind: str | None = Query(default=None),
+    incident_id: int | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
     _user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     return call_service(
         container.notification_service.list_notifications,
         recipient_role=recipient_role,
+        q=q,
+        kind=kind,
+        incident_id=incident_id,
+        date_from=date_from,
+        date_to=date_to,
     )
 
 
