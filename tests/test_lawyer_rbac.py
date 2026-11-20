@@ -119,6 +119,7 @@ class TestLawyerRbacApiMatrix(unittest.TestCase):
                 "severity": Severity.MEDIUM.value,
                 "computer": "GW-01",
                 "employee": "",
+                "source": "manual",
                 "has_personal_data": 0,
             },
             headers=self.ib_hdr,
@@ -136,6 +137,7 @@ class TestLawyerRbacApiMatrix(unittest.TestCase):
                 "severity": Severity.HIGH.value,
                 "computer": "HR-PC-01",
                 "employee": "Орлова Н.В.",
+                "source": "manual",
                 "has_personal_data": 1,
             },
             headers=self.ib_hdr,
@@ -146,7 +148,12 @@ class TestLawyerRbacApiMatrix(unittest.TestCase):
         # Create tasks on both non-PDn and PDn incidents
         t_tech = self.client.post(
             f"/api/incidents/{self.tech_inc_id}/tasks",
-            json={"title": "Проверить правила firewall"},
+            json={
+                "title": "Проверить правила firewall",
+                "description": "Проверить правила на шлюзе",
+                "assigned_to": self.sys_user["id"],
+                "due_date": "2026-12-01T12:00:00+00:00",
+            },
             headers=self.ib_hdr,
         )
         self.assertEqual(t_tech.status_code, 200, t_tech.text)
@@ -154,7 +161,12 @@ class TestLawyerRbacApiMatrix(unittest.TestCase):
 
         t_pdn = self.client.post(
             "/api/incidents/2/tasks",
-            json={"title": "Заблокировать выгрузку CRM"},
+            json={
+                "title": "Заблокировать выгрузку CRM",
+                "description": "Ограничить экспорт из CRM",
+                "assigned_to": self.sys_user["id"],
+                "due_date": "2026-12-01T12:00:00+00:00",
+            },
             headers=self.ib_hdr,
         )
         self.assertEqual(t_pdn.status_code, 200, t_pdn.text)
@@ -366,7 +378,9 @@ class TestLawyerRbacApiMatrix(unittest.TestCase):
                 "/api/incidents",
                 json={
                     "title": "Ручной инцидент юриста",
+                    "description": "Попытка создания инцидента юристом",
                     "incident_type": IncidentType.DATA_LEAK.value,
+                    "source": "manual",
                     "has_personal_data": pd_flag,
                 },
                 headers=self.lawyer_hdr,
@@ -415,7 +429,12 @@ class TestLawyerRbacApiMatrix(unittest.TestCase):
         self.assertEqual(
             self.client.post(
                 "/api/incidents/1/tasks",
-                json={"title": "Задача от юриста"},
+                json={
+                    "title": "Задача от юриста",
+                    "description": "Описание задачи",
+                    "assigned_to": self.sys_user["id"],
+                    "due_date": "2026-12-01T12:00:00+00:00",
+                },
                 headers=self.lawyer_hdr,
             ).status_code,
             403,
@@ -423,7 +442,12 @@ class TestLawyerRbacApiMatrix(unittest.TestCase):
         self.assertEqual(
             self.client.post(
                 "/api/incidents/2/tasks",
-                json={"title": "ПДн задача от юриста"},
+                json={
+                    "title": "ПДн задача от юриста",
+                    "description": "Описание ПДн задачи",
+                    "assigned_to": self.sys_user["id"],
+                    "due_date": "2026-12-01T12:00:00+00:00",
+                },
                 headers=self.lawyer_hdr,
             ).status_code,
             403,

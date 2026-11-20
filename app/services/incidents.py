@@ -12,12 +12,16 @@ from app.enums import (
 )
 from app.integration.adapters import ADAPTER_REGISTRY, SourceAdapter, TelegramAdapter
 from app.repositories.sqlite_repo import (
+    DEFAULT_INCIDENT_SORT_BY,
+    DEFAULT_INCIDENT_SORT_ORDER,
     HistoryRepository,
     IncidentRepository,
     IngestionErrorRepository,
     InstructionRepository,
     MessageRepository,
     TaskRepository,
+    UserRepository,
+    resolve_incident_sort,
     utc_now,
 )
 from app.services.access import AccessControlService
@@ -27,6 +31,8 @@ from app.services.exceptions import (
     ValidationError,
     coerce_user,
 )
+from app.services.users import enrich_tasks_with_users
+from app.services.validators import require_non_blank, require_non_blank_enum_input
 
 
 def normalize_outcome(raw: str | CheckResult | None) -> str | None:
@@ -35,7 +41,9 @@ def normalize_outcome(raw: str | CheckResult | None) -> str | None:
         return None
     if isinstance(raw, CheckResult):
         return raw.value
-    cleaned = str(raw).strip()
+    if not isinstance(raw, str):
+        raise ValidationError("Поле 'outcome' должно быть строкой")
+    cleaned = raw.strip()
     if not cleaned:
         return ""
     try:
@@ -293,15 +301,31 @@ class IngestionService:
     ) -> dict[str, Any]:
         """Create an incident manually after checking RBAC and PDn permissions."""
         actor = coerce_user(user)
-        has_pd = PdnFlag.from_bool_int(data.get("has_personal_data", 0)).to_bool_int()
+        if not isinstance(data, Mapping):
+            raise ValidationError("Данные инцидента должны быть словарём")
+
+        try:
+            has_pd = PdnFlag.from_bool_int(data.get("has_personal_data", 0)).to_bool_int()
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         self.access_control.assert_create_incident_access(
             actor,
             has_personal_data=bool(has_pd),
         )
 
-        incident_type = IncidentType.normalize(data.get("incident_type")).value
-        severity = Severity.normalize(data.get("severity", Severity.MEDIUM)).value
-        source = SourceType.normalize(data.get("source", SourceType.MANUAL)).value
+        title = require_non_blank(data.get("title"), "title")
+        description = require_non_blank(data.get("description"), "description")
+        raw_type = require_non_blank_enum_input(
+            data.get("incident_type"), IncidentType, "incident_type"
+        )
+        raw_source = require_non_blank_enum_input(data.get("source"), SourceType, "source")
+
+        incident_type = IncidentType.normalize(raw_type).value
+        source = SourceType.normalize(raw_source).value
+        try:
+            severity = Severity.normalize(data.get("severity", Severity.MEDIUM)).value
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
 
         now = utc_now()
         detected_at = data.get("detected_at") or now
@@ -310,8 +334,8 @@ class IngestionService:
             instruction_id = self.instruction_repo.find_default_id(incident_type)
 
         incident = Incident(
-            title=str(data["title"]),
-            description=str(data.get("description") or ""),
+            title=title,
+            description=description,
             incident_type=incident_type,
             severity=severity,
             status=IncidentStatus.NEW.value,
@@ -349,6 +373,7 @@ class IncidentService:
         task_repo: TaskRepository,
         access_control: AccessControlService,
         ingestion_service: IngestionService,
+        user_repo: UserRepository | None = None,
     ) -> None:
         self.incident_repo = incident_repo
         self.message_repo = message_repo
@@ -357,6 +382,7 @@ class IncidentService:
         self.task_repo = task_repo
         self.access_control = access_control
         self.ingestion_service = ingestion_service
+        self.user_repo = user_repo or UserRepository(task_repo.db)
 
     def list_incidents(
         self,
@@ -364,14 +390,23 @@ class IncidentService:
         q: str | None = None,
         incident_type: str | None = None,
         status: str | None = None,
+        sort_by: str | None = DEFAULT_INCIDENT_SORT_BY,
+        sort_order: str | None = DEFAULT_INCIDENT_SORT_ORDER,
     ) -> list[dict[str, Any]]:
         """List incidents visible to the current user."""
         actor = coerce_user(user)
+        try:
+            norm_sort_by, norm_sort_order = resolve_incident_sort(sort_by, sort_order)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
         incidents = self.incident_repo.list_filtered(
             q=q,
             incident_type=incident_type,
             status=status,
             exclude_personal_data=not self.access_control.can_view_pdn(actor),
+            sort_by=norm_sort_by,
+            sort_order=norm_sort_order,
         )
         return [
             inc.to_dict()
@@ -406,7 +441,10 @@ class IncidentService:
             }
             for p in self.instruction_repo.list_progress(incident_id)
         ]
-        data["tasks"] = [t.to_dict() for t in self.task_repo.list_by_incident(incident_id)]
+        data["tasks"] = enrich_tasks_with_users(
+            self.task_repo.list_by_incident(incident_id),
+            self.user_repo,
+        )
         return data
 
     def create_incident(
@@ -527,6 +565,7 @@ class IncidentService:
             final_outcome = (
                 normalized_outcome if normalized_outcome is not None else incident.outcome
             )
+            final_outcome = require_non_blank(final_outcome, "outcome")
             incident.close(final_outcome, now)
         else:
             incident.status = IncidentStatus.NEW.value
