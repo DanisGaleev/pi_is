@@ -1,10 +1,11 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Collection, Iterable, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.domain.models import (
@@ -20,6 +21,7 @@ from app.domain.models import (
     User,
 )
 from app.enums import (
+    SEVERITY_WEIGHTS,
     AccessCategory,
     Channel,
     CheckResult,
@@ -31,6 +33,40 @@ from app.enums import (
     SourceType,
     TaskStatus,
 )
+
+
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _to_utc_iso(text: str) -> str:
+    """Parse an ISO-8601 date/datetime string into a fixed-width UTC ISO-8601 string."""
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat(timespec="microseconds")
+
+
+def _iso_utc_key(value: str) -> str:
+    """Normalize a stored timestamp for chronological SQL comparison, falling back safely."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    try:
+        return _to_utc_iso(text)
+    except ValueError:
+        return text
+
+
+def _parse_date_bound(value: str, *, end_of_day: bool) -> str:
+    """Parse a YYYY-MM-DD date or ISO-8601 datetime into a fixed-width UTC ISO bound."""
+    text = value.strip()
+    if end_of_day and _DATE_ONLY_RE.fullmatch(text):
+        day = date.fromisoformat(text)
+        dt = datetime(day.year, day.month, day.day, 23, 59, 59, 999999, tzinfo=timezone.utc)
+        return dt.isoformat(timespec="microseconds")
+    return _to_utc_iso(text)
 
 
 def utc_now() -> str:
@@ -393,6 +429,7 @@ class Database:
             1,
             lambda s: s.casefold() if isinstance(s, str) else s,
         )
+        conn.create_function("iso_utc", 1, _iso_utc_key)
         return conn
 
     @contextmanager
@@ -557,6 +594,53 @@ class UserRepository(_BaseRepository):
             ).fetchall()
             return [_row_to_user(r) for r in rows]
 
+    def list_filtered(
+        self,
+        role: Role | str | None = None,
+        roles: Collection[Role | str] | None = None,
+        active_only: bool = False,
+    ) -> list[User]:
+        """Return users filtered by optional role, allowed roles, and active flag."""
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        if active_only:
+            clauses.append("active = 1")
+        if role is not None:
+            role_val = role.value if isinstance(role, Role) else str(role).strip()
+            if role_val:
+                clauses.append("role = ?")
+                params.append(role_val)
+        if roles is not None:
+            role_vals = [r.value if isinstance(r, Role) else str(r) for r in roles]
+            if not role_vals:
+                return []
+            placeholders = ", ".join("?" for _ in role_vals)
+            clauses.append(f"role IN ({placeholders})")
+            params.extend(role_vals)
+
+        sql = "SELECT id, username, full_name, role, active FROM users"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+
+        with self.db.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [_row_to_user(r) for r in rows]
+
+    def get_by_ids(self, user_ids: Iterable[int]) -> dict[int, User]:
+        """Batch-fetch users keyed by primary key ID."""
+        unique_ids = sorted({int(uid) for uid in user_ids if uid is not None})
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                f"SELECT id, username, full_name, role, active FROM users WHERE id IN ({placeholders})",
+                unique_ids,
+            ).fetchall()
+            return {row["id"]: _row_to_user(row) for row in rows}
+
     def get_names_by_role(self) -> dict[str, str]:
         """Return a mapping of role code to user full name."""
         with self.db.connection() as conn:
@@ -619,6 +703,69 @@ class SessionRepository(_BaseRepository):
             conn.commit()
 
 
+DEFAULT_INCIDENT_SORT_BY = "severity"
+DEFAULT_INCIDENT_SORT_ORDER = "desc"
+
+_SEVERITY_WHEN_CLAUSES = " ".join(
+    f"WHEN '{sev.value}' THEN {weight}"
+    for sev, weight in sorted(SEVERITY_WEIGHTS.items(), key=lambda item: item[1], reverse=True)
+)
+_SEVERITY_PRIORITY_SQL = f"CASE LOWER(severity) {_SEVERITY_WHEN_CLAUSES} ELSE 0 END"
+
+_INCIDENT_SORT_EXPRESSIONS: dict[str, str] = {
+    "severity": _SEVERITY_PRIORITY_SQL,
+    "detected_at": "detected_at",
+    "created_at": "created_at",
+    "id": "id",
+}
+
+_SORT_DIRECTIONS: dict[str, str] = {
+    "desc": "DESC",
+    "asc": "ASC",
+}
+
+
+def resolve_incident_sort(
+    sort_by: str | None = DEFAULT_INCIDENT_SORT_BY,
+    sort_order: str | None = DEFAULT_INCIDENT_SORT_ORDER,
+) -> tuple[str, str]:
+    """Validate and normalize incident sort field and direction against allowlists."""
+    field_key = (
+        DEFAULT_INCIDENT_SORT_BY
+        if sort_by is None
+        else (sort_by.strip().lower() if isinstance(sort_by, str) else "")
+    )
+    if field_key not in _INCIDENT_SORT_EXPRESSIONS:
+        allowed_fields = ", ".join(_INCIDENT_SORT_EXPRESSIONS)
+        raise ValueError(f"Недопустимое поле сортировки {sort_by!r}; разрешены: {allowed_fields}")
+
+    order_key = (
+        DEFAULT_INCIDENT_SORT_ORDER
+        if sort_order is None
+        else (sort_order.strip().lower() if isinstance(sort_order, str) else "")
+    )
+    if order_key not in _SORT_DIRECTIONS:
+        allowed_orders = ", ".join(_SORT_DIRECTIONS)
+        raise ValueError(
+            f"Недопустимое направление сортировки {sort_order!r}; разрешены: {allowed_orders}"
+        )
+
+    return field_key, order_key
+
+
+def _build_incident_order_by(
+    sort_by: str | None = DEFAULT_INCIDENT_SORT_BY,
+    sort_order: str | None = DEFAULT_INCIDENT_SORT_ORDER,
+) -> str:
+    """Build a safe SQL ORDER BY clause using allowlisted expressions only."""
+    field_key, order_key = resolve_incident_sort(sort_by, sort_order)
+    expr = _INCIDENT_SORT_EXPRESSIONS[field_key]
+    direction = _SORT_DIRECTIONS[order_key]
+    if field_key == "id":
+        return f"id {direction}"
+    return f"{expr} {direction}, id {direction}"
+
+
 class IncidentRepository(_BaseRepository):
     """Persistence operations for incidents."""
 
@@ -634,8 +781,11 @@ class IncidentRepository(_BaseRepository):
         incident_type: str | None = None,
         status: str | None = None,
         exclude_personal_data: bool = False,
+        sort_by: str | None = DEFAULT_INCIDENT_SORT_BY,
+        sort_order: str | None = DEFAULT_INCIDENT_SORT_ORDER,
     ) -> list[Incident]:
-        """List incidents matching optional search and filter criteria."""
+        """List incidents matching optional search, filter, and sort criteria."""
+        order_by = _build_incident_order_by(sort_by, sort_order)
         clauses: list[str] = []
         params: list[Any] = []
 
@@ -657,7 +807,7 @@ class IncidentRepository(_BaseRepository):
         sql = "SELECT * FROM incidents"
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY id DESC"
+        sql += f" ORDER BY {order_by}"
 
         with self.db.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -1292,18 +1442,46 @@ class NotificationRepository(_BaseRepository):
             ).fetchone()
             return _row_to_notification(row)
 
-    def list_all(self, recipient_role: str | None = None) -> list[Notification]:
-        """List notifications, optionally filtered by recipient_role."""
+    def list_all(
+        self,
+        recipient_role: str | None = None,
+        q: str | None = None,
+        kind: str | None = None,
+        incident_id: int | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[Notification]:
+        """List notifications ordered newest first, with optional search and filters."""
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        if recipient_role and recipient_role.strip():
+            clauses.append("recipient_role = ?")
+            params.append(recipient_role.strip())
+        if q and q.strip():
+            clauses.append("(cfold(message) LIKE ? OR cfold(recipient_name) LIKE ?)")
+            like = f"%{q.strip().casefold()}%"
+            params.extend([like, like])
+        if kind and kind.strip():
+            clauses.append("kind = ?")
+            params.append(kind.strip())
+        if incident_id is not None:
+            clauses.append("incident_id = ?")
+            params.append(incident_id)
+        if date_from and date_from.strip():
+            clauses.append("iso_utc(created_at) >= ?")
+            params.append(_parse_date_bound(date_from, end_of_day=False))
+        if date_to and date_to.strip():
+            clauses.append("iso_utc(created_at) <= ?")
+            params.append(_parse_date_bound(date_to, end_of_day=True))
+
+        sql = "SELECT * FROM notifications"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC"
+
         with self.db.connection() as conn:
-            if recipient_role:
-                rows = conn.execute(
-                    "SELECT * FROM notifications WHERE recipient_role = ? ORDER BY id DESC",
-                    (recipient_role,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM notifications ORDER BY id DESC"
-                ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
             return [_row_to_notification(r) for r in rows]
 
 

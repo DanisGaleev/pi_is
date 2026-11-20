@@ -1,4 +1,6 @@
 from app.repositories.sqlite_repo import (
+    DEFAULT_INCIDENT_SORT_BY,
+    DEFAULT_INCIDENT_SORT_ORDER,
     SCHEMA_SQL,
     AuditRepository,
     Database,
@@ -14,11 +16,14 @@ from app.repositories.sqlite_repo import (
     get_conn,
     hash_password,
     init_db,
+    resolve_incident_sort,
     utc_now,
 )
 
 __all__ = [
     "AuditRepository",
+    "DEFAULT_INCIDENT_SORT_BY",
+    "DEFAULT_INCIDENT_SORT_ORDER",
     "Database",
     "HistoryRepository",
     "IncidentRepository",
@@ -33,5 +38,6 @@ __all__ = [
     "get_conn",
     "hash_password",
     "init_db",
+    "resolve_incident_sort",
     "utc_now",
 ]
