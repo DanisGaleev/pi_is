@@ -36,6 +36,7 @@ from app.services.ops import (
     ReportService,
     TaskService,
 )
+from app.services.users import UserService
 
 
 class AppContainer:
@@ -94,7 +95,9 @@ class AppContainer:
             task_repo=self.task_repo,
             access_control=self.access_service,
             ingestion_service=self.ingestion_service,
+            user_repo=self.user_repo,
         )
+        self.user_service = UserService(self.user_repo)
         self.instruction_service = InstructionService(
             incident_repo=self.incident_repo,
             instruction_repo=self.instruction_repo,

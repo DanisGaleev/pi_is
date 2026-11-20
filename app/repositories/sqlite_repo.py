@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Collection, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -556,6 +556,53 @@ class UserRepository(_BaseRepository):
                 "SELECT id, username, full_name, role, active FROM users ORDER BY id"
             ).fetchall()
             return [_row_to_user(r) for r in rows]
+
+    def list_filtered(
+        self,
+        role: Role | str | None = None,
+        roles: Collection[Role | str] | None = None,
+        active_only: bool = False,
+    ) -> list[User]:
+        """Return users filtered by optional role, allowed roles, and active flag."""
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        if active_only:
+            clauses.append("active = 1")
+        if role is not None:
+            role_val = role.value if isinstance(role, Role) else str(role).strip()
+            if role_val:
+                clauses.append("role = ?")
+                params.append(role_val)
+        if roles is not None:
+            role_vals = [r.value if isinstance(r, Role) else str(r) for r in roles]
+            if not role_vals:
+                return []
+            placeholders = ", ".join("?" for _ in role_vals)
+            clauses.append(f"role IN ({placeholders})")
+            params.extend(role_vals)
+
+        sql = "SELECT id, username, full_name, role, active FROM users"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id"
+
+        with self.db.connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [_row_to_user(r) for r in rows]
+
+    def get_by_ids(self, user_ids: Iterable[int]) -> dict[int, User]:
+        """Batch-fetch users keyed by primary key ID."""
+        unique_ids = sorted({int(uid) for uid in user_ids if uid is not None})
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                f"SELECT id, username, full_name, role, active FROM users WHERE id IN ({placeholders})",
+                unique_ids,
+            ).fetchall()
+            return {row["id"]: _row_to_user(row) for row in rows}
 
     def get_names_by_role(self) -> dict[str, str]:
         """Return a mapping of role code to user full name."""

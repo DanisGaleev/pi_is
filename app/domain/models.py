@@ -43,6 +43,38 @@ class User:
                 pass
         self.active = bool(self.active)
 
+    @property
+    def role_label(self) -> str:
+        """Return the Russian display label for the user's role."""
+        try:
+            return Role(self.role).label
+        except ValueError:
+            return str(self.role)
+
+    @property
+    def display_label(self) -> str:
+        """Return formatted picker label '<full_name> — <role_label>'."""
+        return f"{self.full_name} — {self.role_label}"
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        """Serialize user summary fields including role label and picker label."""
+        role_val = self.role.value if isinstance(self.role, Role) else str(self.role)
+        role_lbl = self.role_label
+        return {
+            "id": self.id,
+            "username": self.username,
+            "full_name": self.full_name,
+            "role": role_val,
+            "role_label": role_lbl,
+            "label": f"{self.full_name} — {role_lbl}",
+        }
+
+    def to_picker_dict(self) -> dict[str, Any]:
+        """Serialize user fields including active status for assignee selection."""
+        data = self.to_summary_dict()
+        data["active"] = self.active
+        return data
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize user fields to a plain dictionary."""
         return {

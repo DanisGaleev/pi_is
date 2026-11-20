@@ -26,10 +26,24 @@ class TaskCreate(BaseModel):
 class TaskUpdate(BaseModel):
     status: NormalizedTaskStatus | None = None
     result: str | None = None
+    assigned_to: int | None = None
 
 
 class RknDraftUpdate(BaseModel):
     rkn_draft: str
+
+
+@router.get("/users")
+def list_users(
+    role: str | None = Query(default=None),
+    assignable: bool = Query(default=False),
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    return call_service(
+        container.user_service.list_users,
+        role=role,
+        assignable=assignable,
+    )
 
 
 @router.get("/instructions")
