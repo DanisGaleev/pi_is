@@ -18,15 +18,18 @@ from app.repositories.sqlite_repo import (
     InstructionRepository,
     MessageRepository,
     TaskRepository,
+    UserRepository,
     utc_now,
 )
 from app.services.access import AccessControlService
+from app.services.dispatch import IncidentDispatcher
 from app.services.exceptions import (
     AccessDeniedError,
     NotFoundError,
     ValidationError,
     coerce_user,
 )
+from app.services.ops import NotificationService
 
 
 def normalize_outcome(raw: str | CheckResult | None) -> str | None:
@@ -170,6 +173,9 @@ class IngestionService:
         deduplication_service: DeduplicationService,
         access_control: AccessControlService,
         adapters: Mapping[SourceType, SourceAdapter] | None = None,
+        dispatcher: IncidentDispatcher | None = None,
+        user_repo: UserRepository | None = None,
+        notification_service: NotificationService | None = None,
     ) -> None:
         self.incident_repo = incident_repo
         self.message_repo = message_repo
@@ -179,9 +185,12 @@ class IngestionService:
         self.deduplication = deduplication_service
         self.access_control = access_control
         self.adapters = dict(adapters) if adapters is not None else dict(ADAPTER_REGISTRY)
+        self.dispatcher = dispatcher if dispatcher is not None else IncidentDispatcher()
+        self.user_repo = user_repo
+        self.notification_service = notification_service
 
     def receive(self, signal_data: dict[str, Any]) -> dict[str, Any]:
-        """Normalize an external signal, deduplicate or create an incident, or log error."""
+        """Normalize an external signal, classify & dispatch, deduplicate or create incident."""
         raw_source = (
             str(signal_data.get("source") or "").strip()
             if isinstance(signal_data, dict)
@@ -204,6 +213,9 @@ class IngestionService:
 
             if not str(normalized.get("body") or "").strip():
                 raise ValueError("Signal body must not be empty")
+
+            raw_assigned = signal_data.get("assigned_to")
+            assigned_to: int | None = int(raw_assigned) if raw_assigned is not None else None
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             self.ingestion_error_repo.create(
                 source=raw_source or "unknown",
@@ -211,10 +223,42 @@ class IngestionService:
             )
             raise ValidationError(f"Некорректный формат сигнала: {exc}") from exc
 
+        raw_incident_type = signal_data.get("incident_type")
+        error_code = str(signal_data.get("error_code") or "").strip()
+        classified_type = self.dispatcher.classify_signal(
+            body=normalized["body"],
+            incident_type=str(raw_incident_type) if raw_incident_type is not None else None,
+            source=normalized["source"] or raw_source,
+            error_code=error_code,
+        )
+        incident_type = classified_type.value
+        rule = self.dispatcher.get_rule(classified_type)
+
+        raw_severity = signal_data.get("severity")
+        if raw_severity is not None and str(raw_severity).strip():
+            severity = normalized["severity"]
+        else:
+            severity = rule.default_severity.value
+
+        has_personal_data = normalized["has_personal_data"]
+        if classified_type is IncidentType.DATA_LEAK:
+            has_personal_data = 1
+
+        access_category = self.dispatcher.resolve_access_category(
+            classified_type,
+            has_personal_data=has_personal_data,
+            employee=normalized["employee"],
+        ).value
+
+        if assigned_to is None and self.user_repo is not None:
+            assignee = self.user_repo.find_first_by_role(rule.responsible_role)
+            if assignee is not None:
+                assigned_to = assignee.id
+
         existing = self.deduplication.find_related(
             normalized["incident_key"],
             normalized["computer"],
-            normalized["incident_type"],
+            incident_type,
         )
         if existing is not None:
             merged, message_id = self.deduplication.merge(existing, normalized)
@@ -226,7 +270,6 @@ class IngestionService:
             }
 
         now = utc_now()
-        incident_type = normalized["incident_type"]
         origin = normalized["source"] or normalized["sender"] or "external"
         title = (
             normalized["title"]
@@ -238,17 +281,19 @@ class IngestionService:
             title=title,
             description=normalized["body"],
             incident_type=incident_type,
-            severity=normalized["severity"],
+            severity=severity,
             status=IncidentStatus.NEW.value,
             computer=normalized["computer"],
             employee=normalized["employee"],
             source=normalized["source"],
             incident_key=normalized["incident_key"],
-            has_personal_data=normalized["has_personal_data"],
+            has_personal_data=has_personal_data,
             instruction_id=instruction_id,
             detected_at=now,
             created_at=now,
             updated_at=now,
+            access_category=access_category,
+            assigned_to=assigned_to,
         )
         created = self.incident_repo.create(incident)
         msg = self.message_repo.create(
@@ -266,12 +311,39 @@ class IngestionService:
             details=f"Инцидент создан по сигналу ({origin})",
             created_at=now,
         )
+        self._emit_urgent_notifications(created, classified_type, severity)
         self._notify_telegram_reply(source_enum, signal_data, created.id)
         return {
             "incident_id": created.id,
             "deduplicated": False,
             "message_id": msg.id,
         }
+
+    def _emit_urgent_notifications(
+        self,
+        incident: Incident,
+        incident_type: IncidentType,
+        severity: str,
+    ) -> None:
+        if self.notification_service is None or incident.id is None:
+            return
+        urgent_roles = self.dispatcher.resolve_urgent_roles(incident_type, severity)
+        if not urgent_roles:
+            return
+
+        names_by_role = self.user_repo.get_names_by_role() if self.user_repo is not None else {}
+        for role in urgent_roles:
+            recipient_name = names_by_role.get(role.value, role.label)
+            self.notification_service.notify_urgent(
+                incident_id=incident.id,
+                recipient_role=role,
+                recipient_name=recipient_name,
+                kind=f"urgent_dispatch_{role.value}",
+                message=(
+                    f"Срочно ({incident_type.value}, критичность: {severity}): "
+                    f"инцидент #{incident.id} «{incident.title}»."
+                ),
+            )
 
     def _notify_telegram_reply(
         self,

@@ -7,6 +7,7 @@ from app.enums import (
     Channel,
     DeliveryStatus,
     IncidentStatus,
+    IncidentType,
     PdnFlag,
     ReportFormat,
     Role,
@@ -24,6 +25,7 @@ from app.repositories.sqlite_repo import (
     utc_now,
 )
 from app.services.access import AccessControlService
+from app.services.dispatch import IncidentDispatcher
 from app.services.exceptions import AccessDeniedError, NotFoundError, coerce_user
 
 
@@ -628,8 +630,13 @@ class EscalationService:
 class ReportService:
     """Periodic incident aggregation and report export."""
 
-    def __init__(self, incident_repo: IncidentRepository) -> None:
+    def __init__(
+        self,
+        incident_repo: IncidentRepository,
+        dispatcher: IncidentDispatcher | None = None,
+    ) -> None:
         self.incident_repo = incident_repo
+        self.dispatcher = dispatcher if dispatcher is not None else IncidentDispatcher()
 
     @staticmethod
     def _aggregate_incidents(incidents: list[Incident]) -> dict[str, Any]:
@@ -689,6 +696,53 @@ class ReportService:
             "year": target_year,
             "by_month": by_month,
             **stats,
+        }
+
+    def by_type_report(
+        self,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> dict[str, Any]:
+        """Return incident distribution by type, access category, severity, and responsible role."""
+        if year is not None and month is not None:
+            incidents = self.incident_repo.list_by_month(year, month)
+        elif year is not None:
+            incidents = self.incident_repo.list_by_year(year)
+        else:
+            incidents = self.incident_repo.list_filtered()
+
+        by_incident_type: dict[str, int] = {}
+        by_access_category: dict[str, int] = {}
+        by_severity: dict[str, int] = {}
+        by_responsible_role: dict[str, int] = {}
+        pdn_count = 0
+
+        for inc in incidents:
+            norm_type = IncidentType.normalize(inc.incident_type).value
+            by_incident_type[norm_type] = by_incident_type.get(norm_type, 0) + 1
+
+            access_cat = inc.access_category or self.dispatcher.resolve_access_category(
+                norm_type,
+                has_personal_data=inc.has_personal_data,
+                employee=inc.employee,
+            ).value
+            by_access_category[access_cat] = by_access_category.get(access_cat, 0) + 1
+
+            by_severity[inc.severity] = by_severity.get(inc.severity, 0) + 1
+
+            role = self.dispatcher.get_rule(norm_type).responsible_role.value
+            by_responsible_role[role] = by_responsible_role.get(role, 0) + 1
+
+            if PdnFlag.from_bool_int(inc.has_personal_data) is PdnFlag.YES:
+                pdn_count += 1
+
+        return {
+            "total": len(incidents),
+            "personal_data_count": pdn_count,
+            "by_incident_type": by_incident_type,
+            "by_access_category": by_access_category,
+            "by_severity": by_severity,
+            "by_responsible_role": by_responsible_role,
         }
 
     def export_report(

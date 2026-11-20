@@ -71,11 +71,13 @@ class SignalIn(BaseModel):
     body: str
     computer: str = ""
     employee: str = ""
-    incident_type: NormalizedIncidentType = IncidentType.OTHER
-    severity: NormalizedSeverity = Severity.MEDIUM
+    incident_type: NormalizedIncidentType | None = None
+    severity: NormalizedSeverity | None = None
     incident_key: str = ""
     has_personal_data: bool | int | PdnFlag = 0
     title: str | None = None
+    error_code: str = ""
+    assigned_to: int | None = None
 
 
 @router.get("/incidents")
@@ -104,6 +106,13 @@ def create_incident(
         user,
         payload.model_dump(),
     )
+
+
+@router.get("/incidents/dispatch-rules")
+def list_dispatch_rules(
+    _user: dict[str, Any] = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    return call_service(container.dispatcher.list_rules_serialized)
 
 
 @router.get("/incidents/{incident_id}")

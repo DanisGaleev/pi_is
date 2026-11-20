@@ -1,4 +1,5 @@
 from app.services.access import AccessControlService
+from app.services.dispatch import DispatchRule, IncidentDispatcher
 from app.services.exceptions import (
     AccessDeniedError,
     NotFoundError,
@@ -26,7 +27,9 @@ __all__ = [
     "AccessDeniedError",
     "DeadlineService",
     "DeduplicationService",
+    "DispatchRule",
     "EscalationService",
+    "IncidentDispatcher",
     "IncidentService",
     "IngestionService",
     "InstructionService",

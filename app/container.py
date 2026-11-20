@@ -23,6 +23,7 @@ from app.repositories.sqlite_repo import (
     UserRepository,
 )
 from app.services.access import AccessControlService
+from app.services.dispatch import IncidentDispatcher
 from app.services.incidents import (
     DeduplicationService,
     IncidentService,
@@ -71,6 +72,13 @@ class AppContainer:
         self.auth_provider: AuthProvider = self.domain_auth
 
         self.access_service = AccessControlService(self.audit_repo)
+        self.dispatcher = IncidentDispatcher()
+        telegram = self.adapters.get(SourceType.TELEGRAM)
+        self.notification_service = NotificationService(
+            notification_repo=self.notification_repo,
+            user_repo=self.user_repo,
+            telegram_adapter=telegram if isinstance(telegram, TelegramAdapter) else None,
+        )
         self.deduplication_service = DeduplicationService(
             incident_repo=self.incident_repo,
             message_repo=self.message_repo,
@@ -85,6 +93,9 @@ class AppContainer:
             deduplication_service=self.deduplication_service,
             access_control=self.access_service,
             adapters=self.adapters,
+            dispatcher=self.dispatcher,
+            user_repo=self.user_repo,
+            notification_service=self.notification_service,
         )
         self.incident_service = IncidentService(
             incident_repo=self.incident_repo,
@@ -113,12 +124,6 @@ class AppContainer:
             history_repo=self.history_repo,
             access_control=self.access_service,
         )
-        telegram = self.adapters.get(SourceType.TELEGRAM)
-        self.notification_service = NotificationService(
-            notification_repo=self.notification_repo,
-            user_repo=self.user_repo,
-            telegram_adapter=telegram if isinstance(telegram, TelegramAdapter) else None,
-        )
         self.escalation_service = EscalationService(
             incident_repo=self.incident_repo,
             user_repo=self.user_repo,
@@ -126,7 +131,7 @@ class AppContainer:
             notification_service=self.notification_service,
             notification_repo=self.notification_repo,
         )
-        self.report_service = ReportService(self.incident_repo)
+        self.report_service = ReportService(self.incident_repo, dispatcher=self.dispatcher)
 
     def init_db(self) -> None:
         """Initialize and migrate database schema for the active DB_PATH."""
