@@ -156,11 +156,21 @@ def check_escalations(_user: dict[str, Any] = Depends(get_current_user)) -> list
 @router.get("/notifications")
 def list_notifications(
     recipient_role: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+    kind: str | None = Query(default=None),
+    incident_id: int | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
     _user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     return call_service(
         container.notification_service.list_notifications,
         recipient_role=recipient_role,
+        q=q,
+        kind=kind,
+        incident_id=incident_id,
+        date_from=date_from,
+        date_to=date_to,
     )
 
 

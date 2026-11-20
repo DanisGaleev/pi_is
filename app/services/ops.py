@@ -441,10 +441,34 @@ class NotificationService:
 
         return notif.to_dict()
 
-    def list_notifications(self, recipient_role: str | None = None) -> list[dict[str, Any]]:
-        """List notifications ordered newest first, optionally filtered by role."""
-        role_val = recipient_role.value if isinstance(recipient_role, Role) else recipient_role
-        return [n.to_dict() for n in self.notification_repo.list_all(recipient_role=role_val)]
+    def list_notifications(
+        self,
+        recipient_role: Role | str | None = None,
+        q: str | None = None,
+        kind: str | None = None,
+        incident_id: int | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List notifications ordered newest first, optionally filtered by search and facets."""
+        if isinstance(recipient_role, Role):
+            role_val: str | None = recipient_role.value
+        elif isinstance(recipient_role, str):
+            role_val = recipient_role.strip() or None
+        else:
+            role_val = None
+        try:
+            items = self.notification_repo.list_all(
+                recipient_role=role_val,
+                q=q,
+                kind=kind,
+                incident_id=incident_id,
+                date_from=date_from,
+                date_to=date_to,
+            )
+        except ValueError as exc:
+            raise ValidationError(f"Некорректный формат даты: {exc}") from exc
+        return [n.to_dict() for n in items]
 
     def broadcast_warning(self, text: str, recipients: list[str]) -> list[dict[str, Any]]:
         """Send an internal warning broadcast to a list of roles or usernames."""

@@ -11,6 +11,10 @@ from app.enums import (
     Severity,
     SourceType,
 )
+from app.repositories.sqlite_repo import (
+    DEFAULT_INCIDENT_SORT_BY,
+    DEFAULT_INCIDENT_SORT_ORDER,
+)
 from app.services.exceptions import ValidationError
 from app.services.incidents import normalize_outcome
 from app.services.validators import require_non_blank, require_non_blank_enum_input
@@ -114,6 +118,8 @@ def list_incidents(
     q: str | None = None,
     incident_type: str | None = None,
     status: str | None = None,
+    sort_by: str = DEFAULT_INCIDENT_SORT_BY,
+    sort_order: str = DEFAULT_INCIDENT_SORT_ORDER,
     user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     return call_service(
@@ -122,6 +128,8 @@ def list_incidents(
         q=q,
         incident_type=incident_type,
         status=status,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
 

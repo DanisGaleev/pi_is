@@ -12,12 +12,15 @@ from app.enums import (
 )
 from app.integration.adapters import ADAPTER_REGISTRY, SourceAdapter, TelegramAdapter
 from app.repositories.sqlite_repo import (
+    DEFAULT_INCIDENT_SORT_BY,
+    DEFAULT_INCIDENT_SORT_ORDER,
     HistoryRepository,
     IncidentRepository,
     IngestionErrorRepository,
     InstructionRepository,
     MessageRepository,
     TaskRepository,
+    resolve_incident_sort,
     utc_now,
 )
 from app.services.access import AccessControlService
@@ -382,14 +385,23 @@ class IncidentService:
         q: str | None = None,
         incident_type: str | None = None,
         status: str | None = None,
+        sort_by: str | None = DEFAULT_INCIDENT_SORT_BY,
+        sort_order: str | None = DEFAULT_INCIDENT_SORT_ORDER,
     ) -> list[dict[str, Any]]:
         """List incidents visible to the current user."""
         actor = coerce_user(user)
+        try:
+            norm_sort_by, norm_sort_order = resolve_incident_sort(sort_by, sort_order)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
         incidents = self.incident_repo.list_filtered(
             q=q,
             incident_type=incident_type,
             status=status,
             exclude_personal_data=not self.access_control.can_create_pdn(actor),
+            sort_by=norm_sort_by,
+            sort_order=norm_sort_order,
         )
         return [
             inc.to_dict()
