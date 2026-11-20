@@ -4,6 +4,8 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+from app.enums import Role
+
 
 def _db_path() -> str:
     return os.environ.get("DB_PATH", "incidents.db")
@@ -135,10 +137,10 @@ def init_db() -> None:
 def _seed(conn: sqlite3.Connection) -> None:
     pw_hash = _sha256("password123")
     users = [
-        ("ib", pw_hash, "Иванов Алексей (ИБ)", "ib_specialist"),
-        ("sysadmin", pw_hash, "Петров Дмитрий (Сисадмин)", "sysadmin"),
-        ("it_head", pw_hash, "Сидорова Елена (Руководитель ИТ)", "it_head"),
-        ("lawyer", pw_hash, "Козлова Анна (Юрист)", "lawyer"),
+        ("ib", pw_hash, "Иванов Алексей (ИБ)", Role.SECURITY_SPECIALIST.value),
+        ("sysadmin", pw_hash, "Петров Дмитрий (Сисадмин)", Role.SYS_ADMIN.value),
+        ("it_head", pw_hash, "Сидорова Елена (Руководитель ИТ)", Role.IT_HEAD.value),
+        ("lawyer", pw_hash, "Козлова Анна (Юрист)", Role.LAWYER.value),
     ]
     conn.executemany(
         "INSERT INTO users (username, password_hash, full_name, role) VALUES (?, ?, ?, ?)",

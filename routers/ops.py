@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from app.enums import Role
 from auth import get_current_user
 from db import get_conn, utc_now
 
@@ -49,7 +50,7 @@ def _get_incident(
     row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Инцидент не найден")
-    if forbid_sysadmin_pdn and user["role"] == "sysadmin" and row["has_personal_data"] == 1:
+    if forbid_sysadmin_pdn and user["role"] == Role.SYS_ADMIN and row["has_personal_data"] == 1:
         raise HTTPException(status_code=403, detail="Доступ к инцидентам с ПДн запрещен")
     return row
 
@@ -181,7 +182,8 @@ def create_task(
         assigned_to = payload.assigned_to
         if assigned_to is None:
             sysadmin_row = conn.execute(
-                "SELECT id FROM users WHERE role = 'sysadmin' ORDER BY id LIMIT 1"
+                "SELECT id FROM users WHERE role = ? ORDER BY id LIMIT 1",
+                (Role.SYS_ADMIN.value,),
             ).fetchone()
             assigned_to = sysadmin_row["id"] if sysadmin_row else None
 
@@ -221,7 +223,7 @@ def list_tasks(
         clauses = []
         params: list = []
 
-        if user["role"] == "sysadmin":
+        if user["role"] == Role.SYS_ADMIN:
             clauses.append("i.has_personal_data = 0")
 
         if assigned_to == "me":
@@ -274,7 +276,7 @@ def update_task(
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Задача не найдена")
-        if user["role"] == "sysadmin" and row["has_personal_data"] == 1:
+        if user["role"] == Role.SYS_ADMIN and row["has_personal_data"] == 1:
             raise HTTPException(status_code=403, detail="Доступ к задачам по инцидентам с ПДн запрещен")
 
         new_status = payload.status if payload.status is not None else row["status"]
@@ -313,7 +315,7 @@ def get_rkn_info(
     incident_id: int,
     user: dict = Depends(get_current_user),
 ) -> dict:
-    if user["role"] == "sysadmin":
+    if user["role"] == Role.SYS_ADMIN:
         raise HTTPException(status_code=403, detail="Доступ к данным РКН запрещен")
     conn = get_conn()
     try:
@@ -329,7 +331,7 @@ def update_rkn_draft(
     payload: RknDraftUpdate,
     user: dict = Depends(get_current_user),
 ) -> dict:
-    if user["role"] == "sysadmin":
+    if user["role"] == Role.SYS_ADMIN:
         raise HTTPException(status_code=403, detail="Доступ к данным РКН запрещен")
     conn = get_conn()
     try:
@@ -392,8 +394,8 @@ def check_escalations(_user: dict = Depends(get_current_user)) -> list[dict]:
             r["role"]: r["full_name"]
             for r in conn.execute("SELECT role, full_name FROM users").fetchall()
         }
-        it_head_name = users_by_role.get("it_head", "Руководитель ИТ")
-        lawyer_name = users_by_role.get("lawyer", "Юрист")
+        it_head_name = users_by_role.get(Role.IT_HEAD.value, Role.IT_HEAD.label)
+        lawyer_name = users_by_role.get(Role.LAWYER.value, Role.LAWYER.label)
 
         open_incidents = conn.execute(
             "SELECT * FROM incidents WHERE status != 'Закрыт'"
@@ -410,7 +412,7 @@ def check_escalations(_user: dict = Depends(get_current_user)) -> list[dict]:
                 notif = _insert_notification_if_new(
                     conn,
                     inc["id"],
-                    "it_head",
+                    Role.IT_HEAD.value,
                     it_head_name,
                     "escalation_30m",
                     msg,
@@ -427,7 +429,7 @@ def check_escalations(_user: dict = Depends(get_current_user)) -> list[dict]:
                 lawyer_notif = _insert_notification_if_new(
                     conn,
                     inc["id"],
-                    "lawyer",
+                    Role.LAWYER.value,
                     lawyer_name,
                     "pdn_lawyer_notice",
                     lawyer_msg,
@@ -443,8 +445,8 @@ def check_escalations(_user: dict = Depends(get_current_user)) -> list[dict]:
                 acc_notif = _insert_notification_if_new(
                     conn,
                     inc["id"],
-                    "chief_accountant",
-                    "Главный бухгалтер",
+                    Role.ACCOUNTANT.value,
+                    users_by_role.get(Role.ACCOUNTANT.value, Role.ACCOUNTANT.label),
                     "pdn_accounting_notice",
                     acc_msg,
                     now_iso,

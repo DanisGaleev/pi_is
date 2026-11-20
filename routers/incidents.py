@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from app.enums import Role
 from auth import get_current_user
 from db import get_conn, utc_now
 
@@ -59,7 +60,7 @@ def _get_incident_or_404(conn, incident_id: int):
 
 
 def _assert_access(user: dict, incident) -> None:
-    if user["role"] == "sysadmin" and incident["has_personal_data"]:
+    if user["role"] == Role.SYS_ADMIN and incident["has_personal_data"]:
         raise HTTPException(status_code=403, detail="Доступ к инцидентам с ПДн запрещен")
 
 
@@ -95,7 +96,7 @@ def list_incidents(
     clauses: list[str] = []
     params: list[object] = []
 
-    if user["role"] == "sysadmin":
+    if user["role"] == Role.SYS_ADMIN:
         clauses.append("has_personal_data = 0")
     if q:
         clauses.append("(computer LIKE ? OR employee LIKE ?)")
@@ -127,7 +128,7 @@ def create_incident(
     user: dict = Depends(get_current_user),
 ) -> dict:
     has_pd = int(bool(payload.has_personal_data))
-    if user["role"] == "sysadmin" and has_pd:
+    if user["role"] == Role.SYS_ADMIN and has_pd:
         raise HTTPException(status_code=403, detail="Доступ к инцидентам с ПДн запрещен")
 
     now = utc_now()
@@ -229,7 +230,7 @@ def update_incident(
         updates = payload.model_dump(exclude_unset=True)
         if "has_personal_data" in updates:
             updates["has_personal_data"] = int(bool(updates["has_personal_data"]))
-            if user["role"] == "sysadmin" and updates["has_personal_data"]:
+            if user["role"] == Role.SYS_ADMIN and updates["has_personal_data"]:
                 raise HTTPException(status_code=403, detail="Доступ к инцидентам с ПДн запрещен")
 
         if updates:

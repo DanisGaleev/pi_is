@@ -4,6 +4,7 @@ import secrets
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 
+from app.enums import Role
 from db import get_conn, utc_now
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -18,12 +19,19 @@ class LoginRequest(BaseModel):
     password: str
 
 
+def _parse_role(value: str) -> Role | str:
+    try:
+        return Role(value)
+    except ValueError:
+        return value
+
+
 def _user_dict(row) -> dict:
     return {
         "id": row["id"],
         "username": row["username"],
         "full_name": row["full_name"],
-        "role": row["role"],
+        "role": _parse_role(row["role"]),
     }
 
 
