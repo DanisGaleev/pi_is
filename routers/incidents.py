@@ -1,25 +1,70 @@
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from typing import Annotated
 
-from app.enums import Role
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, BeforeValidator
+
+from app.enums import (
+    AccessCategory,
+    CheckResult,
+    IncidentStatus,
+    IncidentType,
+    PdnFlag,
+    Role,
+    Severity,
+    SourceType,
+)
 from auth import get_current_user
 from db import get_conn, utc_now
 
 router = APIRouter(prefix="/api", tags=["incidents"])
 
-VALID_STATUSES = {"Новый", "В работе", "На проверке", "Закрыт"}
+
+def _normalize_signal_source(raw: str | SourceType | None) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, SourceType):
+        return raw.value
+    if not str(raw).strip():
+        return ""
+    return SourceType.normalize(raw).value
+
+
+def _normalize_outcome(raw: str | CheckResult | None) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, CheckResult):
+        return raw.value
+    cleaned = str(raw).strip()
+    if not cleaned:
+        return ""
+    try:
+        return CheckResult.normalize(cleaned).value
+    except ValueError:
+        return cleaned
+
+
+def _pdn_to_int(val: bool | int | PdnFlag) -> int:
+    return PdnFlag.from_bool_int(val).to_bool_int()
+
+
+NormalizedIncidentType = Annotated[IncidentType, BeforeValidator(IncidentType.normalize)]
+NormalizedSeverity = Annotated[Severity, BeforeValidator(Severity.normalize)]
+NormalizedIncidentStatus = Annotated[IncidentStatus, BeforeValidator(IncidentStatus.normalize)]
+NormalizedSourceType = Annotated[SourceType, BeforeValidator(SourceType.normalize)]
+SignalSource = Annotated[str, BeforeValidator(_normalize_signal_source)]
+NormalizedOutcome = Annotated[str | None, BeforeValidator(_normalize_outcome)]
 
 
 class IncidentCreate(BaseModel):
     title: str
     description: str = ""
-    incident_type: str
-    severity: str = "medium"
+    incident_type: NormalizedIncidentType
+    severity: NormalizedSeverity = Severity.MEDIUM
     computer: str = ""
     employee: str = ""
-    source: str = "manual"
+    source: NormalizedSourceType = SourceType.MANUAL
     incident_key: str = ""
-    has_personal_data: bool | int = 0
+    has_personal_data: bool | int | PdnFlag = 0
     instruction_id: int | None = None
     detected_at: str | None = None
 
@@ -27,28 +72,28 @@ class IncidentCreate(BaseModel):
 class IncidentUpdate(BaseModel):
     title: str | None = None
     description: str | None = None
-    incident_type: str | None = None
-    severity: str | None = None
-    has_personal_data: bool | int | None = None
+    incident_type: NormalizedIncidentType | None = None
+    severity: NormalizedSeverity | None = None
+    has_personal_data: bool | int | PdnFlag | None = None
     instruction_id: int | None = None
     rkn_draft: str | None = None
 
 
 class StatusTransition(BaseModel):
-    status: str
-    outcome: str | None = None
+    status: NormalizedIncidentStatus
+    outcome: NormalizedOutcome = None
 
 
 class SignalIn(BaseModel):
-    source: str = ""
+    source: SignalSource = ""
     sender: str = ""
     body: str
     computer: str = ""
     employee: str = ""
-    incident_type: str = "Прочее"
-    severity: str = "medium"
+    incident_type: NormalizedIncidentType = IncidentType.OTHER
+    severity: NormalizedSeverity = Severity.MEDIUM
     incident_key: str = ""
-    has_personal_data: bool | int = 0
+    has_personal_data: bool | int | PdnFlag = 0
     title: str | None = None
 
 
@@ -59,8 +104,16 @@ def _get_incident_or_404(conn, incident_id: int):
     return row
 
 
+def _incident_access_category(incident) -> AccessCategory:
+    if PdnFlag.from_bool_int(incident["has_personal_data"]) is PdnFlag.YES:
+        return AccessCategory.PERSONAL_DATA
+    if str(incident["employee"] or "").strip():
+        return AccessCategory.EMPLOYEE_INVOLVED
+    return AccessCategory.TECHNICAL
+
+
 def _assert_access(user: dict, incident) -> None:
-    if user["role"] == Role.SYS_ADMIN and incident["has_personal_data"]:
+    if user["role"] == Role.SYS_ADMIN and _incident_access_category(incident) is AccessCategory.PERSONAL_DATA:
         raise HTTPException(status_code=403, detail="Доступ к инцидентам с ПДн запрещен")
 
 
@@ -103,11 +156,13 @@ def list_incidents(
         like = f"%{q}%"
         params.extend([like, like])
     if incident_type:
+        resolved_type = IncidentType.resolve(incident_type)
         clauses.append("incident_type = ?")
-        params.append(incident_type)
+        params.append(resolved_type.value if resolved_type is not None else incident_type)
     if status:
+        resolved_status = IncidentStatus.resolve(status)
         clauses.append("status = ?")
-        params.append(status)
+        params.append(resolved_status.value if resolved_status is not None else status)
 
     sql = "SELECT * FROM incidents"
     if clauses:
@@ -127,7 +182,7 @@ def create_incident(
     payload: IncidentCreate,
     user: dict = Depends(get_current_user),
 ) -> dict:
-    has_pd = int(bool(payload.has_personal_data))
+    has_pd = _pdn_to_int(payload.has_personal_data)
     if user["role"] == Role.SYS_ADMIN and has_pd:
         raise HTTPException(status_code=403, detail="Доступ к инцидентам с ПДн запрещен")
 
@@ -138,7 +193,7 @@ def create_incident(
     try:
         instruction_id = payload.instruction_id
         if instruction_id is None:
-            instruction_id = _default_instruction_id(conn, payload.incident_type)
+            instruction_id = _default_instruction_id(conn, payload.incident_type.value)
 
         cur = conn.execute(
             """
@@ -146,16 +201,17 @@ def create_incident(
                 title, description, incident_type, severity, status, outcome,
                 computer, employee, source, incident_key, has_personal_data,
                 instruction_id, detected_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 'Новый', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.title,
                 payload.description,
-                payload.incident_type,
-                payload.severity,
+                payload.incident_type.value,
+                payload.severity.value,
+                IncidentStatus.NEW.value,
                 payload.computer,
                 payload.employee,
-                payload.source,
+                payload.source.value,
                 payload.incident_key,
                 has_pd,
                 instruction_id,
@@ -228,8 +284,12 @@ def update_incident(
         _assert_access(user, incident)
 
         updates = payload.model_dump(exclude_unset=True)
+        if updates.get("incident_type") is not None:
+            updates["incident_type"] = updates["incident_type"].value
+        if updates.get("severity") is not None:
+            updates["severity"] = updates["severity"].value
         if "has_personal_data" in updates:
-            updates["has_personal_data"] = int(bool(updates["has_personal_data"]))
+            updates["has_personal_data"] = _pdn_to_int(updates["has_personal_data"])
             if user["role"] == Role.SYS_ADMIN and updates["has_personal_data"]:
                 raise HTTPException(status_code=403, detail="Доступ к инцидентам с ПДн запрещен")
 
@@ -259,9 +319,6 @@ def change_status(
     payload: StatusTransition,
     user: dict = Depends(get_current_user),
 ) -> dict:
-    if payload.status not in VALID_STATUSES:
-        raise HTTPException(status_code=400, detail="Недопустимый статус")
-
     conn = get_conn()
     try:
         incident = _get_incident_or_404(conn, incident_id)
@@ -269,11 +326,11 @@ def change_status(
 
         now = utc_now()
         taken_at = incident["taken_at"]
-        if payload.status == "В работе" and not taken_at:
+        if payload.status == IncidentStatus.IN_PROGRESS and not taken_at:
             taken_at = now
 
         closed_at = incident["closed_at"]
-        if payload.status == "Закрыт":
+        if payload.status == IncidentStatus.CLOSED:
             closed_at = now
 
         outcome = payload.outcome if payload.outcome is not None else incident["outcome"]
@@ -284,9 +341,9 @@ def change_status(
             SET status = ?, outcome = ?, taken_at = ?, closed_at = ?, updated_at = ?
             WHERE id = ?
             """,
-            (payload.status, outcome, taken_at, closed_at, now, incident_id),
+            (payload.status.value, outcome, taken_at, closed_at, now, incident_id),
         )
-        details = f"{incident['status']} -> {payload.status}"
+        details = f"{incident['status']} -> {payload.status.value}"
         if outcome:
             details += f" ({outcome})"
         _log_history(conn, incident_id, user["id"], "status_change", details, now)
@@ -301,24 +358,24 @@ def ingest_signal(payload: SignalIn) -> dict:
     now = utc_now()
     key = payload.incident_key.strip()
     computer = payload.computer.strip()
-    incident_type = payload.incident_type.strip()
+    incident_type = payload.incident_type.value
 
     conn = get_conn()
     try:
         existing = None
         if key:
             existing = conn.execute(
-                "SELECT * FROM incidents WHERE status != 'Закрыт' AND incident_key = ? ORDER BY id DESC LIMIT 1",
-                (key,),
+                "SELECT * FROM incidents WHERE status != ? AND incident_key = ? ORDER BY id DESC LIMIT 1",
+                (IncidentStatus.CLOSED.value, key),
             ).fetchone()
         if existing is None and computer and incident_type:
             existing = conn.execute(
                 """
                 SELECT * FROM incidents
-                WHERE status != 'Закрыт' AND computer = ? AND incident_type = ?
+                WHERE status != ? AND computer = ? AND incident_type = ?
                 ORDER BY id DESC LIMIT 1
                 """,
-                (computer, incident_type),
+                (IncidentStatus.CLOSED.value, computer, incident_type),
             ).fetchone()
 
         if existing is not None:
@@ -327,26 +384,27 @@ def ingest_signal(payload: SignalIn) -> dict:
             conn.execute("UPDATE incidents SET updated_at = ? WHERE id = ?", (now, incident_id))
         else:
             deduplicated = False
-            title = payload.title or f"{payload.incident_type}: {computer or payload.sender or payload.source or 'Сигнал'}"
-            instruction_id = _default_instruction_id(conn, payload.incident_type)
+            title = payload.title or f"{incident_type}: {computer or payload.sender or payload.source or 'Сигнал'}"
+            instruction_id = _default_instruction_id(conn, incident_type)
             cur = conn.execute(
                 """
                 INSERT INTO incidents (
                     title, description, incident_type, severity, status, outcome,
                     computer, employee, source, incident_key, has_personal_data,
                     instruction_id, detected_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'Новый', '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     title,
                     payload.body,
-                    payload.incident_type,
-                    payload.severity,
+                    incident_type,
+                    payload.severity.value,
+                    IncidentStatus.NEW.value,
                     computer,
                     payload.employee.strip(),
                     payload.source,
                     key,
-                    int(bool(payload.has_personal_data)),
+                    _pdn_to_int(payload.has_personal_data),
                     instruction_id,
                     now,
                     now,

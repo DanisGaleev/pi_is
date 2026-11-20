@@ -4,7 +4,15 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
-from app.enums import Role
+from app.enums import (
+    CheckResult,
+    IncidentStatus,
+    IncidentType,
+    Role,
+    Severity,
+    SourceType,
+    TaskStatus,
+)
 
 
 def _db_path() -> str:
@@ -22,7 +30,7 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-SCHEMA_SQL = """
+SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT UNIQUE NOT NULL,
@@ -50,7 +58,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     description TEXT NOT NULL DEFAULT '',
     incident_type TEXT NOT NULL,
     severity TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'Новый',
+    status TEXT NOT NULL DEFAULT '{IncidentStatus.NEW.value}',
     outcome TEXT NOT NULL DEFAULT '',
     computer TEXT NOT NULL DEFAULT '',
     employee TEXT NOT NULL DEFAULT '',
@@ -100,7 +108,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     assigned_to INTEGER REFERENCES users(id),
-    status TEXT NOT NULL DEFAULT 'Открыта',
+    status TEXT NOT NULL DEFAULT '{TaskStatus.OPEN.value}',
     result TEXT NOT NULL DEFAULT '',
     created_by INTEGER REFERENCES users(id),
     created_at TEXT NOT NULL,
@@ -150,7 +158,7 @@ def _seed(conn: sqlite3.Connection) -> None:
     instructions = [
         (
             "Реагирование на вредоносное ПО",
-            "Вирус / Вредоносное ПО",
+            IncidentType.VIRUS.value,
             json.dumps(
                 [
                     "Изолировать рабочую станцию от сети",
@@ -163,7 +171,7 @@ def _seed(conn: sqlite3.Connection) -> None:
         ),
         (
             "Реагирование на утечку ПДн",
-            "Утечка ПДн",
+            IncidentType.DATA_LEAK.value,
             json.dumps(
                 [
                     "Зафиксировать объем и категории персональных данных",
@@ -176,7 +184,7 @@ def _seed(conn: sqlite3.Connection) -> None:
         ),
         (
             "Реагирование на фишинг",
-            "Фишинг",
+            IncidentType.PHISHING.value,
             json.dumps(
                 [
                     "Заблокировать домен/отправителя в почтовом шлюзе",
@@ -188,7 +196,7 @@ def _seed(conn: sqlite3.Connection) -> None:
         ),
         (
             "Несанкционированный доступ",
-            "Несанкционированный доступ",
+            IncidentType.UNAUTHORIZED_ACCESS.value,
             json.dumps(
                 [
                     "Заблокировать подозрительную учетную запись/сессию",
@@ -214,13 +222,13 @@ def _seed(conn: sqlite3.Connection) -> None:
         (
             "Обнаружен троян на WS-FIN-04",
             "Антивирус зафиксировал попытку запуска Trojan.GenericKD на рабочей станции.",
-            "Вирус / Вредоносное ПО",
-            "high",
-            "Новый",
+            IncidentType.VIRUS.value,
+            Severity.HIGH.value,
+            IncidentStatus.NEW.value,
             "",
             "WS-FIN-04",
             "Смирнова О.В.",
-            "antivirus",
+            SourceType.KASPERSKY.value,
             "av-ws-fin-04-trojan",
             0,
             1,
@@ -234,13 +242,13 @@ def _seed(conn: sqlite3.Connection) -> None:
         (
             "Подозрение на выгрузку базы клиентов",
             "DLP-система зафиксировала выгрузку архива с ПДн клиентов на внешний ресурс.",
-            "Утечка ПДн",
-            "critical",
-            "В работе",
+            IncidentType.DATA_LEAK.value,
+            Severity.CRITICAL.value,
+            IncidentStatus.IN_PROGRESS.value,
             "",
             "SRV-CRM-01",
             "Волков И.П.",
-            "dlp",
+            SourceType.DLP.value,
             "dlp-crm-export-01",
             1,
             2,
@@ -254,13 +262,13 @@ def _seed(conn: sqlite3.Connection) -> None:
         (
             "Фишинговая рассылка на бухгалтерию",
             "Получено письмо с поддельным счетом и вредоносной ссылкой.",
-            "Фишинг",
-            "medium",
-            "Закрыт",
-            "Ложное срабатывание",
+            IncidentType.PHISHING.value,
+            Severity.MEDIUM.value,
+            IncidentStatus.CLOSED.value,
+            CheckResult.FALSE_POSITIVE.value,
             "WS-ACC-02",
             "Морозова Т.А.",
-            "mail_gateway",
+            SourceType.EMAIL.value,
             "mail-phish-acc-02",
             0,
             3,
@@ -286,17 +294,17 @@ def _seed(conn: sqlite3.Connection) -> None:
 
     conn.execute(
         "INSERT INTO messages (incident_id, source, sender, body, incident_key, received_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (1, "antivirus", "AV-Agent", "Обнаружен Trojan.GenericKD на WS-FIN-04", "av-ws-fin-04-trojan", t_45m_ago),
+        (1, SourceType.KASPERSKY.value, "AV-Agent", "Обнаружен Trojan.GenericKD на WS-FIN-04", "av-ws-fin-04-trojan", t_45m_ago),
     )
     conn.execute(
         "INSERT INTO messages (incident_id, source, sender, body, incident_key, received_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (2, "dlp", "DLP-Sensor", "Выгрузка файла clients_pdn.zip с SRV-CRM-01", "dlp-crm-export-01", t_2h_ago),
+        (2, SourceType.DLP.value, "DLP-Sensor", "Выгрузка файла clients_pdn.zip с SRV-CRM-01", "dlp-crm-export-01", t_2h_ago),
     )
     conn.execute(
         "INSERT INTO history (incident_id, user_id, action, details, created_at) VALUES (?, ?, ?, ?, ?)",
-        (1, None, "created", "Инцидент создан по сигналу antivirus", t_45m_ago),
+        (1, None, "created", f"Инцидент создан по сигналу {SourceType.KASPERSKY.value}", t_45m_ago),
     )
     conn.execute(
         "INSERT INTO history (incident_id, user_id, action, details, created_at) VALUES (?, ?, ?, ?, ?)",
-        (2, 1, "status_changed", "Статус изменен на В работе", t_2h_ago),
+        (2, 1, "status_changed", f"Статус изменен на {IncidentStatus.IN_PROGRESS.value}", t_2h_ago),
     )
