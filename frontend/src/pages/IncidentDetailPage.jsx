@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import {
   changeIncidentStatus,
+  confirmRkn,
   createTask,
   getIncident,
   getRkn,
   listInstructions,
+  listUsers,
   updateIncident,
   updateRkn,
   updateStep,
@@ -15,6 +17,9 @@ const INCIDENT_TYPES = [
   "Утечка ПДн",
   "Фишинг",
   "Несанкционированный доступ",
+  "Подбор пароля",
+  "Обман с платежами",
+  "Уязвимость (CVE)",
   "Прочее",
 ];
 
@@ -111,20 +116,27 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
 
   const [taskTitle, setTaskTitle] = useState("");
   const [taskDesc, setTaskDesc] = useState("");
+  const [taskAssignee, setTaskAssignee] = useState("");
+  const [taskDueDate, setTaskDueDate] = useState("");
+  const [assignableUsers, setAssignableUsers] = useState([]);
   const [saving, setSaving] = useState(false);
 
   const isSysadmin = user?.role === "sysadmin";
+  const isLawyer = user?.role === "lawyer";
+  const [rknConfirmText, setRknConfirmText] = useState("");
 
   async function loadAll() {
     setLoading(true);
     setError("");
     try {
-      const [incData, instrData] = await Promise.all([
+      const [incData, instrData, usersData] = await Promise.all([
         getIncident(incidentId),
         listInstructions(),
+        listUsers({ assignable: true }),
       ]);
       setIncident(incData);
       setInstructions(instrData);
+      setAssignableUsers(usersData);
       setClassForm({
         incident_type: incData.incident_type || INCIDENT_TYPES[0],
         severity: incData.severity || "medium",
@@ -162,6 +174,10 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
   }, [rkn]);
 
   async function handleStatusChange(nextStatus, selectedOutcome) {
+    if (nextStatus === "Закрыт" && !selectedOutcome?.trim()) {
+      setError("Укажите итог закрытия инцидента");
+      return;
+    }
     setSaving(true);
     setError("");
     setNotice("");
@@ -182,13 +198,16 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
     setError("");
     setNotice("");
     try {
-      await updateIncident(incidentId, {
-        incident_type: classForm.incident_type,
-        severity: classForm.severity,
-        ...(isSysadmin
-          ? {}
-          : { has_personal_data: classForm.has_personal_data ? 1 : 0 }),
-      });
+      const payload = isLawyer
+        ? { has_personal_data: classForm.has_personal_data ? 1 : 0 }
+        : {
+            incident_type: classForm.incident_type,
+            severity: classForm.severity,
+            ...(isSysadmin
+              ? {}
+              : { has_personal_data: classForm.has_personal_data ? 1 : 0 }),
+          };
+      await updateIncident(incidentId, payload);
       setNotice("Классификация сохранена");
       await loadAll();
     } catch (err) {
@@ -209,6 +228,22 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
       setNotice("Черновик уведомления РКН сохранен");
     } catch (err) {
       setError(err.message || "Не удалось сохранить черновик РКН");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleConfirmRkn() {
+    setSaving(true);
+    setError("");
+    setNotice("");
+    try {
+      const updated = await confirmRkn(incidentId, rknConfirmText.trim());
+      setRkn(updated);
+      setRknConfirmText("");
+      setNotice("Отправка уведомления РКН подтверждена");
+    } catch (err) {
+      setError(err.message || "Не удалось подтвердить отправку уведомления РКН");
     } finally {
       setSaving(false);
     }
@@ -244,6 +279,14 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
   async function handleCreateTask(e) {
     e.preventDefault();
     if (!taskTitle.trim()) return;
+    if (!taskAssignee) {
+      setError("Выберите исполнителя задачи");
+      return;
+    }
+    if (!taskDueDate) {
+      setError("Укажите срок выполнения задачи");
+      return;
+    }
     setSaving(true);
     setError("");
     setNotice("");
@@ -251,9 +294,13 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
       await createTask(incidentId, {
         title: taskTitle.trim(),
         description: taskDesc.trim(),
+        assigned_to: Number(taskAssignee),
+        due_date: new Date(taskDueDate).toISOString(),
       });
       setTaskTitle("");
       setTaskDesc("");
+      setTaskAssignee("");
+      setTaskDueDate("");
       setNotice("Задача сисадмину создана");
       await loadAll();
     } catch (err) {
@@ -319,7 +366,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-          {incident.status !== "В работе" && incident.status !== "Закрыт" && (
+          {!isLawyer && incident.status !== "В работе" && incident.status !== "Закрыт" && (
             <button
               type="button"
               className="btn btn-primary"
@@ -329,7 +376,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
               Взять в работу
             </button>
           )}
-          {incident.status !== "На проверке" && incident.status !== "Закрыт" && (
+          {!isLawyer && incident.status !== "На проверке" && incident.status !== "Закрыт" && (
             <button
               type="button"
               className="btn btn-dark"
@@ -339,7 +386,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
               На проверку
             </button>
           )}
-          {incident.status !== "Закрыт" && (
+          {!isLawyer && incident.status !== "Закрыт" && (
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
               <select
                 value={outcome}
@@ -418,38 +465,42 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
             <h2>Классификация</h2>
           </div>
           <form onSubmit={handleSaveClassification}>
-            <div className="form-field">
-              <label htmlFor="cls-type">Тип инцидента</label>
-              <select
-                id="cls-type"
-                value={classForm.incident_type}
-                onChange={(e) =>
-                  setClassForm({ ...classForm, incident_type: e.target.value })
-                }
-              >
-                {INCIDENT_TYPES.map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div className="form-field">
-              <label htmlFor="cls-severity">Важность</label>
-              <select
-                id="cls-severity"
-                value={classForm.severity}
-                onChange={(e) =>
-                  setClassForm({ ...classForm, severity: e.target.value })
-                }
-              >
-                {SEVERITIES.map((s) => (
-                  <option key={s.value} value={s.value}>
-                    {s.label}
-                  </option>
-                ))}
-              </select>
-            </div>
+            {!isLawyer && (
+              <>
+                <div className="form-field">
+                  <label htmlFor="cls-type">Тип инцидента</label>
+                  <select
+                    id="cls-type"
+                    value={classForm.incident_type}
+                    onChange={(e) =>
+                      setClassForm({ ...classForm, incident_type: e.target.value })
+                    }
+                  >
+                    {INCIDENT_TYPES.map((t) => (
+                      <option key={t} value={t}>
+                        {t}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-field">
+                  <label htmlFor="cls-severity">Важность</label>
+                  <select
+                    id="cls-severity"
+                    value={classForm.severity}
+                    onChange={(e) =>
+                      setClassForm({ ...classForm, severity: e.target.value })
+                    }
+                  >
+                    {SEVERITIES.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </>
+            )}
             {!isSysadmin && (
               <div className="form-field">
                 <label className="checkbox-label">
@@ -525,9 +576,47 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
           >
             Сохранить черновик РКН
           </button>
+
+          <div style={{ marginTop: "16px", borderTop: "1px solid var(--border, #e2e2e2)", paddingTop: "12px" }}>
+            {rkn.sent_at ? (
+              <div>
+                <div>
+                  <span className="muted">Отправлено:</span>{" "}
+                  <strong>{formatDateTime(rkn.sent_at)}</strong>
+                </div>
+                {rkn.confirmation && (
+                  <div>
+                    <span className="muted">Подтверждение:</span> {rkn.confirmation}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <>
+                <div className="form-field">
+                  <label htmlFor="rkn-confirm">Подтверждение фактической отправки (номер письма, скрин и т.п.)</label>
+                  <input
+                    id="rkn-confirm"
+                    type="text"
+                    value={rknConfirmText}
+                    onChange={(e) => setRknConfirmText(e.target.value)}
+                    placeholder="Например, исх. №12 от 01.01.2026"
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-primary"
+                  disabled={saving}
+                  onClick={handleConfirmRkn}
+                >
+                  Подтвердить отправку в РКН
+                </button>
+              </>
+            )}
+          </div>
         </div>
       )}
 
+      {!isLawyer && (
       <div className="grid-2">
         <div className="card">
           <div className="card-header">
@@ -604,6 +693,32 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
                 placeholder="Дополнительные указания"
               />
             </div>
+            <div className="form-field">
+              <label htmlFor="task-assignee">Исполнитель *</label>
+              <select
+                id="task-assignee"
+                value={taskAssignee}
+                onChange={(e) => setTaskAssignee(e.target.value)}
+                required
+              >
+                <option value="">Выберите сотрудника...</option>
+                {assignableUsers.map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="form-field">
+              <label htmlFor="task-due">Срок выполнения *</label>
+              <input
+                id="task-due"
+                type="datetime-local"
+                value={taskDueDate}
+                onChange={(e) => setTaskDueDate(e.target.value)}
+                required
+              />
+            </div>
             <button
               type="submit"
               className="btn btn-primary btn-sm"
@@ -627,6 +742,10 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
                   {t.description && (
                     <div className="muted">{t.description}</div>
                   )}
+                  <div className="muted">
+                    Исполнитель: {t.assigned_to_user?.label || "-"} | Поставил:{" "}
+                    {t.created_by_user?.label || "-"}
+                  </div>
                   {t.result && (
                     <div style={{ marginTop: "4px" }}>
                       Результат: {t.result}
@@ -638,6 +757,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
           )}
         </div>
       </div>
+      )}
 
       <div className="grid-2">
         <div className="card">
