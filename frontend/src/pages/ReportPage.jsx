@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { getMonthlyReport } from '../api';
+import { getByTypeReport, getMonthlyReport } from '../api';
 
 const MONTHS = [
   { value: 1, label: 'Январь' },
@@ -21,6 +21,23 @@ const SEVERITY_LABELS = {
   medium: 'Средняя',
   high: 'Высокая',
   critical: 'Критическая',
+};
+
+const ACCESS_CATEGORY_LABELS = {
+  technical: 'Техническая',
+  personal_data: 'Персональные данные',
+  employee_involved: 'С участием сотрудника',
+};
+
+const ROLE_LABELS = {
+  ib_specialist: 'Специалист ИБ',
+  sysadmin: 'Сисадмин',
+  it_head: 'Руководитель ИТ',
+  lawyer: 'Юрист',
+  director: 'Директор',
+  chief_accountant: 'Главный бухгалтер',
+  foreman: 'Мастер участка',
+  employee: 'Сотрудник',
 };
 
 function BreakdownTable({ title, data, labels }) {
@@ -61,6 +78,7 @@ export default function ReportPage() {
   const [year, setYear] = useState(now.getFullYear());
   const [month, setMonth] = useState(now.getMonth() + 1);
   const [report, setReport] = useState(null);
+  const [byType, setByType] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -68,8 +86,12 @@ export default function ReportPage() {
     setLoading(true);
     setError('');
     try {
-      const data = await getMonthlyReport(y, m);
-      setReport(data);
+      const [monthly, byTypeData] = await Promise.all([
+        getMonthlyReport(y, m),
+        getByTypeReport(y, m),
+      ]);
+      setReport(monthly);
+      setByType(byTypeData);
     } catch (err) {
       setError(err.message || 'Не удалось сформировать отчёт');
     } finally {
@@ -153,6 +175,21 @@ export default function ReportPage() {
               <BreakdownTable title="По итогам проверки" data={report.by_outcome} />
               <BreakdownTable title="По важности" data={report.by_severity} labels={SEVERITY_LABELS} />
             </div>
+
+            {byType && (
+              <div className="grid-2" style={{ marginTop: 16 }}>
+                <BreakdownTable
+                  title="По категории доступа"
+                  data={byType.by_access_category}
+                  labels={ACCESS_CATEGORY_LABELS}
+                />
+                <BreakdownTable
+                  title="По ответственной роли"
+                  data={byType.by_responsible_role}
+                  labels={ROLE_LABELS}
+                />
+              </div>
+            )}
           </>
         )
       )}
