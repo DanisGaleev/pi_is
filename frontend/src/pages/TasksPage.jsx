@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { listTasks, updateTask } from '../api';
+import { listTasks, listUsers, updateTask } from '../api';
 
 const DONE_STATUSES = new Set(['выполнена', 'завершена', 'закрыта', 'done']);
 
@@ -7,12 +7,14 @@ function isDone(status) {
   return DONE_STATUSES.has(String(status || '').trim().toLowerCase());
 }
 
-export default function TasksPage({ onOpenIncident }) {
+export default function TasksPage({ user, onOpenIncident }) {
   const [scope, setScope] = useState('me');
   const [tasks, setTasks] = useState([]);
   const [results, setResults] = useState({});
+  const [assignableUsers, setAssignableUsers] = useState([]);
   const [loading, setLoading] = useState(true);
   const [savingId, setSavingId] = useState(null);
+  const [reassigningId, setReassigningId] = useState(null);
   const [error, setError] = useState('');
 
   async function loadTasks(currentScope = scope) {
@@ -20,8 +22,12 @@ export default function TasksPage({ onOpenIncident }) {
     setError('');
     try {
       const params = currentScope === 'me' ? { assigned_to: 'me' } : {};
-      const data = await listTasks(params);
+      const [data, usersData] = await Promise.all([
+        listTasks(params),
+        listUsers({ assignable: true }),
+      ]);
       setTasks(data);
+      setAssignableUsers(usersData);
       const initialResults = {};
       for (const t of data) {
         initialResults[t.id] = t.result || '';
@@ -39,18 +45,37 @@ export default function TasksPage({ onOpenIncident }) {
   }, [scope]);
 
   async function handleComplete(task) {
+    const resultText = (results[task.id] || '').trim();
+    if (!resultText) {
+      setError('Укажите результат выполнения задачи перед завершением');
+      return;
+    }
     setSavingId(task.id);
     setError('');
     try {
       await updateTask(task.id, {
         status: 'Выполнена',
-        result: results[task.id] || '',
+        result: resultText,
       });
       await loadTasks(scope);
     } catch (err) {
       setError(err.message || 'Не удалось завершить задачу');
     } finally {
       setSavingId(null);
+    }
+  }
+
+  async function handleReassign(task, newAssigneeId) {
+    if (!newAssigneeId || Number(newAssigneeId) === task.assigned_to) return;
+    setReassigningId(task.id);
+    setError('');
+    try {
+      await updateTask(task.id, { assigned_to: Number(newAssigneeId) });
+      await loadTasks(scope);
+    } catch (err) {
+      setError(err.message || 'Не удалось сменить исполнителя');
+    } finally {
+      setReassigningId(null);
     }
   }
 
@@ -91,6 +116,7 @@ export default function TasksPage({ onOpenIncident }) {
                   <th>ID</th>
                   <th>Инцидент</th>
                   <th>Задача</th>
+                  <th>Исполнитель</th>
                   <th>Статус</th>
                   <th>Результат выполнения</th>
                   <th>Действие</th>
@@ -114,6 +140,24 @@ export default function TasksPage({ onOpenIncident }) {
                       <td>
                         <div style={{ fontWeight: 600 }}>{task.title}</div>
                         {task.description && <div className="muted">{task.description}</div>}
+                      </td>
+                      <td style={{ minWidth: 180 }}>
+                        <select
+                          value={task.assigned_to || ''}
+                          onChange={(e) => handleReassign(task, e.target.value)}
+                          disabled={done || reassigningId === task.id}
+                        >
+                          {!assignableUsers.some((u) => u.id === task.assigned_to) && (
+                            <option value={task.assigned_to || ''}>
+                              {task.assigned_to_user?.label || '-'}
+                            </option>
+                          )}
+                          {assignableUsers.map((u) => (
+                            <option key={u.id} value={u.id}>
+                              {u.label}
+                            </option>
+                          ))}
+                        </select>
                       </td>
                       <td>
                         <span className={`badge ${done ? 'status-closed' : 'status-progress'}`}>
