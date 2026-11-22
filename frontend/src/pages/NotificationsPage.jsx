@@ -22,11 +22,29 @@ export default function NotificationsPage({ onOpenIncident }) {
   const [info, setInfo] = useState('');
   const [error, setError] = useState('');
 
-  async function loadNotifications() {
+  const [q, setQ] = useState('');
+  const [kind, setKind] = useState('');
+  const [recipientRole, setRecipientRole] = useState('');
+  const [incidentId, setIncidentId] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+
+  function currentFilters() {
+    return {
+      q,
+      kind,
+      recipient_role: recipientRole,
+      incident_id: incidentId || undefined,
+      date_from: dateFrom || undefined,
+      date_to: dateTo || undefined,
+    };
+  }
+
+  async function loadNotifications(filters = currentFilters()) {
     setLoading(true);
     setError('');
     try {
-      const data = await listNotifications();
+      const data = await listNotifications(filters);
       setItems(data);
     } catch (err) {
       setError(err.message || 'Не удалось загрузить уведомления');
@@ -36,8 +54,23 @@ export default function NotificationsPage({ onOpenIncident }) {
   }
 
   useEffect(() => {
-    loadNotifications();
-  }, []);
+    loadNotifications(currentFilters());
+  }, [kind, recipientRole]);
+
+  function handleSearchSubmit(e) {
+    e.preventDefault();
+    loadNotifications(currentFilters());
+  }
+
+  function handleResetFilters() {
+    setQ('');
+    setKind('');
+    setRecipientRole('');
+    setIncidentId('');
+    setDateFrom('');
+    setDateTo('');
+    loadNotifications({ q: '', kind: '', recipient_role: '' });
+  }
 
   async function handleCheckEscalations() {
     setChecking(true);
@@ -77,6 +110,65 @@ export default function NotificationsPage({ onOpenIncident }) {
       {info && <div className="alert alert-info">{info}</div>}
 
       <div className="card">
+        <form className="toolbar" onSubmit={handleSearchSubmit}>
+          <input
+            type="text"
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="Поиск по сообщению или получателю..."
+            style={{ maxWidth: '280px' }}
+          />
+          <select value={kind} onChange={(e) => setKind(e.target.value)} style={{ maxWidth: '220px' }}>
+            <option value="">Все типы</option>
+            {Object.entries(KIND_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <select
+            value={recipientRole}
+            onChange={(e) => setRecipientRole(e.target.value)}
+            style={{ maxWidth: '220px' }}
+          >
+            <option value="">Все роли</option>
+            {Object.entries(ROLE_LABELS).map(([value, label]) => (
+              <option key={value} value={value}>
+                {label}
+              </option>
+            ))}
+          </select>
+          <input
+            type="number"
+            value={incidentId}
+            onChange={(e) => setIncidentId(e.target.value)}
+            placeholder="ID инцидента"
+            style={{ maxWidth: '130px' }}
+          />
+          <input
+            type="date"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            style={{ maxWidth: '160px' }}
+            aria-label="Дата с"
+          />
+          <input
+            type="date"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            style={{ maxWidth: '160px' }}
+            aria-label="Дата по"
+          />
+          <button type="submit" className="btn btn-dark">
+            Найти
+          </button>
+          {(q || kind || recipientRole || incidentId || dateFrom || dateTo) && (
+            <button type="button" className="btn" onClick={handleResetFilters}>
+              Сбросить
+            </button>
+          )}
+        </form>
+
         {loading ? (
           <div className="muted">Загрузка журнала...</div>
         ) : items.length === 0 ? (
