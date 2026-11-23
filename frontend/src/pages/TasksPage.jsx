@@ -16,6 +16,7 @@ export default function TasksPage({ user, onOpenIncident }) {
   const [savingId, setSavingId] = useState(null);
   const [reassigningId, setReassigningId] = useState(null);
   const [error, setError] = useState('');
+  const canEditOperational = ['ib_specialist', 'sysadmin', 'it_head'].includes(user?.role);
 
   async function loadTasks(currentScope = scope) {
     setLoading(true);
@@ -24,7 +25,7 @@ export default function TasksPage({ user, onOpenIncident }) {
       const params = currentScope === 'me' ? { assigned_to: 'me' } : {};
       const [data, usersData] = await Promise.all([
         listTasks(params),
-        listUsers({ assignable: true }),
+        canEditOperational ? listUsers({ assignable: true }) : Promise.resolve([]),
       ]);
       setTasks(data);
       setAssignableUsers(usersData);
@@ -127,11 +128,13 @@ export default function TasksPage({ user, onOpenIncident }) {
                   const done = isDone(task.status);
                   return (
                     <tr key={task.id}>
-                      <td>#{task.id}</td>
+                      <td className="mono">#{task.id}</td>
                       <td>
                         <button
                           type="button"
                           className="btn btn-sm"
+                          title={`#${task.incident_id} ${task.incident_title || 'Открыть'}`}
+                          style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', display: 'inline-block' }}
                           onClick={() => onOpenIncident && onOpenIncident(task.incident_id)}
                         >
                           #{task.incident_id} {task.incident_title || 'Открыть'}
@@ -141,52 +144,69 @@ export default function TasksPage({ user, onOpenIncident }) {
                         <div style={{ fontWeight: 600 }}>{task.title}</div>
                         {task.description && <div className="muted">{task.description}</div>}
                       </td>
-                      <td style={{ minWidth: 180 }}>
-                        <select
-                          value={task.assigned_to || ''}
-                          onChange={(e) => handleReassign(task, e.target.value)}
-                          disabled={done || reassigningId === task.id}
-                        >
-                          {!assignableUsers.some((u) => u.id === task.assigned_to) && (
-                            <option value={task.assigned_to || ''}>
-                              {task.assigned_to_user?.label || '-'}
-                            </option>
-                          )}
-                          {assignableUsers.map((u) => (
-                            <option key={u.id} value={u.id}>
-                              {u.label}
-                            </option>
-                          ))}
-                        </select>
+                      <td style={{ width: 165, minWidth: 150 }}>
+                        {canEditOperational ? (
+                          <select
+                            value={task.assigned_to || ''}
+                            title={
+                              assignableUsers.find((u) => u.id === task.assigned_to)?.label ||
+                              task.assigned_to_user?.label ||
+                              ''
+                            }
+                            style={{ fontSize: '12.5px', padding: '6px 8px' }}
+                            onChange={(e) => handleReassign(task, e.target.value)}
+                            disabled={done || reassigningId === task.id}
+                          >
+                            {!assignableUsers.some((u) => u.id === task.assigned_to) && (
+                              <option value={task.assigned_to || ''}>
+                                {task.assigned_to_user?.label || '-'}
+                              </option>
+                            )}
+                            {assignableUsers.map((u) => (
+                              <option key={u.id} value={u.id}>
+                                {u.label}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          <span className="muted">{task.assigned_to_user?.label || '-'}</span>
+                        )}
                       </td>
                       <td>
                         <span className={`badge ${done ? 'status-closed' : 'status-progress'}`}>
                           {task.status}
                         </span>
                       </td>
-                      <td style={{ minWidth: 220 }}>
-                        <input
-                          type="text"
-                          value={results[task.id] ?? ''}
-                          onChange={(e) =>
-                            setResults((prev) => ({ ...prev, [task.id]: e.target.value }))
-                          }
-                          placeholder="Краткий итог выполнения"
-                          disabled={done}
-                        />
+                      <td style={{ minWidth: 135 }}>
+                        {canEditOperational ? (
+                          <input
+                            type="text"
+                            value={results[task.id] ?? ''}
+                            title={results[task.id] ?? ''}
+                            onChange={(e) =>
+                              setResults((prev) => ({ ...prev, [task.id]: e.target.value }))
+                            }
+                            placeholder="Краткий итог выполнения"
+                            disabled={done}
+                          />
+                        ) : (
+                          <span>{task.result || '—'}</span>
+                        )}
                       </td>
                       <td>
                         {done ? (
                           <span className="muted">Завершена</span>
-                        ) : (
+                        ) : canEditOperational ? (
                           <button
                             type="button"
                             className="btn btn-primary btn-sm"
                             disabled={savingId === task.id}
                             onClick={() => handleComplete(task)}
                           >
-                            {savingId === task.id ? 'Сохранение...' : 'Завершить задачу'}
+                            {savingId === task.id ? 'Сохранение...' : 'Завершить'}
                           </button>
+                        ) : (
+                          <span className="muted">Только чтение</span>
                         )}
                       </td>
                     </tr>

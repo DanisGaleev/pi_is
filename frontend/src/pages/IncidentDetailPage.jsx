@@ -123,6 +123,23 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
 
   const isSysadmin = user?.role === "sysadmin";
   const isLawyer = user?.role === "lawyer";
+  const canEditOperational = ["ib_specialist", "sysadmin", "it_head"].includes(
+    user?.role
+  );
+  const canMarkPdn = ["ib_specialist", "it_head", "lawyer"].includes(
+    user?.role
+  );
+  const canViewRkn = [
+    "ib_specialist",
+    "it_head",
+    "lawyer",
+    "director",
+    "chief_accountant",
+  ].includes(user?.role);
+  const canEditRkn = ["ib_specialist", "it_head", "lawyer"].includes(
+    user?.role
+  );
+  const canViewTasks = !isLawyer;
   const [rknConfirmText, setRknConfirmText] = useState("");
 
   async function loadAll() {
@@ -132,7 +149,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
       const [incData, instrData, usersData] = await Promise.all([
         getIncident(incidentId),
         listInstructions(),
-        listUsers({ assignable: true }),
+        canEditOperational ? listUsers({ assignable: true }) : Promise.resolve([]),
       ]);
       setIncident(incData);
       setInstructions(instrData);
@@ -146,7 +163,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
         setOutcome(incData.outcome);
       }
 
-      if (incData.has_personal_data === 1 && !isSysadmin) {
+      if (incData.has_personal_data === 1 && canViewRkn) {
         const rknData = await getRkn(incidentId);
         setRkn(rknData);
         setRknDraft(rknData.rkn_draft || "");
@@ -370,7 +387,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-          {!isLawyer && incident.status !== "В работе" && incident.status !== "Закрыт" && (
+          {canEditOperational && incident.status !== "В работе" && incident.status !== "Закрыт" && (
             <button
               type="button"
               className="btn btn-primary"
@@ -380,7 +397,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
               Взять в работу
             </button>
           )}
-          {!isLawyer && incident.status !== "На проверке" && incident.status !== "Закрыт" && (
+          {canEditOperational && incident.status !== "На проверке" && incident.status !== "Закрыт" && (
             <button
               type="button"
               className="btn btn-dark"
@@ -390,7 +407,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
               На проверку
             </button>
           )}
-          {!isLawyer && incident.status !== "Закрыт" && (
+          {canEditOperational && incident.status !== "Закрыт" && (
             <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
               <select
                 value={outcome}
@@ -468,72 +485,89 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
           <div className="card-header">
             <h2>Классификация</h2>
           </div>
-          <form onSubmit={handleSaveClassification}>
-            {!isLawyer && (
-              <>
-                <div className="form-field">
-                  <label htmlFor="cls-type">Тип инцидента</label>
-                  <select
-                    id="cls-type"
-                    value={classForm.incident_type}
-                    onChange={(e) =>
-                      setClassForm({ ...classForm, incident_type: e.target.value })
-                    }
-                  >
-                    {INCIDENT_TYPES.map((t) => (
-                      <option key={t} value={t}>
-                        {t}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="form-field">
-                  <label htmlFor="cls-severity">Важность</label>
-                  <select
-                    id="cls-severity"
-                    value={classForm.severity}
-                    onChange={(e) =>
-                      setClassForm({ ...classForm, severity: e.target.value })
-                    }
-                  >
-                    {SEVERITIES.map((s) => (
-                      <option key={s.value} value={s.value}>
-                        {s.label}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </>
-            )}
-            {!isSysadmin && (
-              <div className="form-field">
-                <label className="checkbox-label">
-                  <input
-                    type="checkbox"
-                    checked={classForm.has_personal_data}
-                    onChange={(e) =>
-                      setClassForm({
-                        ...classForm,
-                        has_personal_data: e.target.checked,
-                      })
-                    }
-                  />
-                  <span>Утечка / затрагивание ПДн</span>
-                </label>
+          {!canEditOperational && !canMarkPdn ? (
+            <div className="grid-2" style={{ gap: "8px", fontSize: "13px" }}>
+              <div>
+                <span className="muted">Тип инцидента:</span>{" "}
+                <strong>{incident.incident_type || "-"}</strong>
               </div>
-            )}
-            <button
-              type="submit"
-              className="btn btn-primary"
-              disabled={saving}
-            >
-              Сохранить классификацию
-            </button>
-          </form>
+              <div>
+                <span className="muted">Важность:</span>{" "}
+                <strong>{SEVERITY_LABELS[incident.severity] || incident.severity}</strong>
+              </div>
+              <div>
+                <span className="muted">Затрагивает ПДн:</span>{" "}
+                <strong>{incident.has_personal_data === 1 ? "Да" : "Нет"}</strong>
+              </div>
+            </div>
+          ) : (
+            <form onSubmit={handleSaveClassification}>
+              {canEditOperational && (
+                <>
+                  <div className="form-field">
+                    <label htmlFor="cls-type">Тип инцидента</label>
+                    <select
+                      id="cls-type"
+                      value={classForm.incident_type}
+                      onChange={(e) =>
+                        setClassForm({ ...classForm, incident_type: e.target.value })
+                      }
+                    >
+                      {INCIDENT_TYPES.map((t) => (
+                        <option key={t} value={t}>
+                          {t}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="form-field">
+                    <label htmlFor="cls-severity">Важность</label>
+                    <select
+                      id="cls-severity"
+                      value={classForm.severity}
+                      onChange={(e) =>
+                        setClassForm({ ...classForm, severity: e.target.value })
+                      }
+                    >
+                      {SEVERITIES.map((s) => (
+                        <option key={s.value} value={s.value}>
+                          {s.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </>
+              )}
+              {canMarkPdn && (
+                <div className="form-field">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={classForm.has_personal_data}
+                      onChange={(e) =>
+                        setClassForm({
+                          ...classForm,
+                          has_personal_data: e.target.checked,
+                        })
+                      }
+                    />
+                    <span>Утечка / затрагивание ПДн</span>
+                  </label>
+                </div>
+              )}
+              <button
+                type="submit"
+                className="btn btn-primary"
+                disabled={saving}
+              >
+                Сохранить классификацию
+              </button>
+            </form>
+          )}
         </div>
       </div>
 
-      {incident.has_personal_data === 1 && !isSysadmin && rkn && (
+      {incident.has_personal_data === 1 && canViewRkn && rkn && (
         <div className="card rkn-box">
           <div className="card-header">
             <h2>Контроль сроков РКН (152-ФЗ)</h2>
@@ -569,17 +603,20 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
               id="rkn-draft"
               rows={7}
               value={rknDraft}
+              readOnly={!canEditRkn}
               onChange={(e) => setRknDraft(e.target.value)}
             />
           </div>
-          <button
-            type="button"
-            className="btn btn-dark"
-            disabled={saving}
-            onClick={handleSaveRknDraft}
-          >
-            Сохранить черновик РКН
-          </button>
+          {canEditRkn && (
+            <button
+              type="button"
+              className="btn btn-dark"
+              disabled={saving}
+              onClick={handleSaveRknDraft}
+            >
+              Сохранить черновик РКН
+            </button>
+          )}
 
           <div style={{ marginTop: "16px", borderTop: "1px solid var(--border, #e2e2e2)", paddingTop: "12px" }}>
             {rkn.sent_at ? (
@@ -594,7 +631,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
                   </div>
                 )}
               </div>
-            ) : (
+            ) : canEditRkn ? (
               <>
                 <div className="form-field">
                   <label htmlFor="rkn-confirm">Подтверждение фактической отправки (номер письма, скрин и т.п.)</label>
@@ -615,12 +652,14 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
                   Подтвердить отправку в РКН
                 </button>
               </>
+            ) : (
+              <div className="muted">Уведомление в РКН ещё не отправлено.</div>
             )}
           </div>
         </div>
       )}
 
-      {!isLawyer && (
+      {canViewTasks && (
       <div className="grid-2">
         <div className="card">
           <div className="card-header">
@@ -631,6 +670,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
             <select
               id="instr-select"
               value={incident.instruction_id || ""}
+              disabled={!canEditOperational}
               onChange={handleInstructionChange}
             >
               <option value="">Без инструкции</option>
@@ -654,6 +694,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
                       <input
                         type="checkbox"
                         checked={done}
+                        disabled={!canEditOperational}
                         onChange={(e) =>
                           handleStepToggle(idx, e.target.checked)
                         }
@@ -675,6 +716,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
           <div className="card-header">
             <h2>Задачи по инциденту</h2>
           </div>
+          {canEditOperational && (
           <form onSubmit={handleCreateTask} style={{ marginBottom: "14px" }}>
             <div className="form-field">
               <label htmlFor="task-title">Поручение *</label>
@@ -732,6 +774,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
               Поставить задачу
             </button>
           </form>
+          )}
 
           {(!incident.tasks || incident.tasks.length === 0) ? (
             <div className="muted">Задачи по этому инциденту отсутствуют.</div>

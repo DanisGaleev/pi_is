@@ -127,8 +127,14 @@ const SEVERITIES = [
   { value: 'critical', label: 'Критический' },
 ];
 
-export default function SimulatorPage({ onOpenIncident }) {
-  const [form, setForm] = useState(PRESETS[0].data);
+export default function SimulatorPage({ user, onOpenIncident }) {
+  const canViewPdn = ['ib_specialist', 'it_head', 'lawyer', 'director', 'chief_accountant'].includes(
+    user?.role
+  );
+  const [form, setForm] = useState(() => ({
+    ...PRESETS[0].data,
+    has_personal_data: canViewPdn ? PRESETS[0].data.has_personal_data : false,
+  }));
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
@@ -141,7 +147,10 @@ export default function SimulatorPage({ onOpenIncident }) {
   }, []);
 
   function applyPreset(preset) {
-    setForm({ ...preset.data });
+    setForm({
+      ...preset.data,
+      has_personal_data: canViewPdn ? preset.data.has_personal_data : false,
+    });
     setResult(null);
     setError('');
   }
@@ -156,7 +165,8 @@ export default function SimulatorPage({ onOpenIncident }) {
     setError('');
     setResult(null);
     try {
-      const res = await sendSignal(form);
+      const payload = canViewPdn ? form : { ...form, has_personal_data: false };
+      const res = await sendSignal(payload);
       setResult(res);
     } catch (err) {
       setError(err.message || 'Не удалось отправить сигнал');
@@ -312,16 +322,18 @@ export default function SimulatorPage({ onOpenIncident }) {
               />
             </div>
 
-            <div className="form-field" style={{ justifyContent: 'flex-end' }}>
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={Boolean(form.has_personal_data)}
-                  onChange={(e) => updateField('has_personal_data', e.target.checked)}
-                />
-                <span>Затрагивает персональные данные (ПДн)</span>
-              </label>
-            </div>
+            {canViewPdn && (
+              <div className="form-field" style={{ justifyContent: 'flex-end' }}>
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(form.has_personal_data)}
+                    onChange={(e) => updateField('has_personal_data', e.target.checked)}
+                  />
+                  <span>Затрагивает персональные данные (ПДн)</span>
+                </label>
+              </div>
+            )}
           </div>
 
           <div className="form-field">
@@ -356,14 +368,23 @@ export default function SimulatorPage({ onOpenIncident }) {
                 </tr>
               </thead>
               <tbody>
-                {dispatchRules.map((rule) => (
-                  <tr key={rule.incident_type}>
-                    <td>{rule.incident_type}</td>
-                    <td>{rule.default_severity}</td>
-                    <td>{rule.responsible_role_label || rule.responsible_role}</td>
-                    <td className="muted">{rule.description}</td>
-                  </tr>
-                ))}
+                {dispatchRules.map((rule) => {
+                  const sevLabel =
+                    SEVERITIES.find((s) => s.value === rule.default_severity)?.label ||
+                    rule.default_severity;
+                  return (
+                    <tr key={rule.incident_type}>
+                      <td>{rule.incident_type}</td>
+                      <td>
+                        <span className={`badge severity-${rule.default_severity || 'medium'}`}>
+                          {sevLabel}
+                        </span>
+                      </td>
+                      <td>{rule.responsible_role_label || rule.responsible_role}</td>
+                      <td className="muted">{rule.description}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

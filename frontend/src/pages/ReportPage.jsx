@@ -17,10 +17,10 @@ const MONTHS = [
 ];
 
 const SEVERITY_LABELS = {
-  low: 'Низкая',
-  medium: 'Средняя',
-  high: 'Высокая',
-  critical: 'Критическая',
+  low: 'Низкий',
+  medium: 'Средний',
+  high: 'Высокий',
+  critical: 'Критический',
 };
 
 const ACCESS_CATEGORY_LABELS = {

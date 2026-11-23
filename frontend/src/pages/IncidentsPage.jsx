@@ -86,8 +86,13 @@ export default function IncidentsPage({ user, onOpenIncident }) {
     has_personal_data: false,
   });
 
-  const isSysadmin = user?.role === "sysadmin";
   const isLawyer = user?.role === "lawyer";
+  const canCreatePdn = [
+    "ib_specialist",
+    "it_head",
+    "director",
+    "chief_accountant",
+  ].includes(user?.role);
 
   function currentFilters() {
     return { q, incident_type: incidentType, status, sort_by: sortBy, sort_order: sortOrder };
@@ -146,7 +151,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
         computer: form.computer.trim(),
         employee: form.employee.trim(),
         source: "manual",
-        has_personal_data: isSysadmin ? 0 : form.has_personal_data ? 1 : 0,
+        has_personal_data: canCreatePdn && form.has_personal_data ? 1 : 0,
       });
       setForm({
         title: "",
@@ -181,9 +186,34 @@ export default function IncidentsPage({ user, onOpenIncident }) {
             className="btn btn-primary"
             onClick={() => setShowForm((v) => !v)}
           >
-            {showForm ? "Скрыть форму" : "Зарегистрировать инцидент"}
+            {showForm ? "Скрыть форму" : "+ Зарегистрировать инцидент"}
           </button>
         )}
+      </div>
+
+      <div className="grid-4">
+        <div className="kpi-card">
+          <div className="kpi-label">Всего в выборке</div>
+          <div className="kpi-value">{incidents.length}</div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">В работе / Новые</div>
+          <div className="kpi-value accent">
+            {incidents.filter((i) => i.status !== "Закрыт").length}
+          </div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">Критических</div>
+          <div className="kpi-value danger">
+            {incidents.filter((i) => i.severity === "critical").length}
+          </div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">Связано с ПДн</div>
+          <div className="kpi-value">
+            {incidents.filter((i) => i.has_personal_data === 1).length}
+          </div>
+        </div>
       </div>
 
       {showForm && !isLawyer && (
@@ -261,7 +291,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
                   placeholder="ФИО сотрудника"
                 />
               </div>
-              {!isSysadmin && (
+              {canCreatePdn && (
                 <div className="form-field" style={{ justifyContent: "flex-end" }}>
                   <label className="checkbox-label">
                     <input
@@ -318,12 +348,12 @@ export default function IncidentsPage({ user, onOpenIncident }) {
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder="Поиск по компьютеру или сотруднику..."
-            style={{ maxWidth: "280px" }}
+            style={{ flex: "1 1 200px", minWidth: "180px" }}
           />
           <select
             value={incidentType}
             onChange={(e) => setIncidentType(e.target.value)}
-            style={{ maxWidth: "220px" }}
+            style={{ width: "auto", minWidth: "155px" }}
           >
             <option value="">Все типы</option>
             {INCIDENT_TYPES.map((t) => (
@@ -335,7 +365,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
           <select
             value={status}
             onChange={(e) => setStatus(e.target.value)}
-            style={{ maxWidth: "180px" }}
+            style={{ width: "auto", minWidth: "130px" }}
           >
             <option value="">Все статусы</option>
             {STATUSES.map((s) => (
@@ -347,7 +377,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
           <select
             value={sortBy}
             onChange={(e) => setSortBy(e.target.value)}
-            style={{ maxWidth: "180px" }}
+            style={{ width: "auto", minWidth: "175px" }}
           >
             {SORT_FIELDS.map((s) => (
               <option key={s.value} value={s.value}>
@@ -358,7 +388,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
           <select
             value={sortOrder}
             onChange={(e) => setSortOrder(e.target.value)}
-            style={{ maxWidth: "140px" }}
+            style={{ width: "auto", minWidth: "135px" }}
           >
             <option value="desc">По убыванию</option>
             <option value="asc">По возрастанию</option>
@@ -402,7 +432,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
                       className="clickable"
                       onClick={() => onOpenIncident(inc.id)}
                     >
-                      <td>#{inc.id}</td>
+                      <td className="mono">#{inc.id}</td>
                       <td>
                         <div style={{ fontWeight: 600 }}>{inc.title}</div>
                         <div style={{ display: "flex", gap: "6px", marginTop: "4px", flexWrap: "wrap" }}>
@@ -437,7 +467,9 @@ export default function IncidentsPage({ user, onOpenIncident }) {
                         <div>{inc.computer || "-"}</div>
                         <div className="muted">{inc.employee || "-"}</div>
                       </td>
-                      <td>{formatDateTime(inc.detected_at)}</td>
+                      <td className="mono" style={{ whiteSpace: "nowrap" }}>
+                        {formatDateTime(inc.detected_at)}
+                      </td>
                     </tr>
                   );
                 })}
