@@ -279,6 +279,10 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
   async function handleCreateTask(e) {
     e.preventDefault();
     if (!taskTitle.trim()) return;
+    if (!taskDesc.trim()) {
+      setError("Укажите детали задачи");
+      return;
+    }
     if (!taskAssignee) {
       setError("Выберите исполнителя задачи");
       return;
@@ -301,7 +305,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
       setTaskDesc("");
       setTaskAssignee("");
       setTaskDueDate("");
-      setNotice("Задача сисадмину создана");
+      setNotice("Задача создана");
       await loadAll();
     } catch (err) {
       setError(err.message || "Не удалось создать задачу");
@@ -669,7 +673,7 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
 
         <div className="card">
           <div className="card-header">
-            <h2>Задачи системному администратору</h2>
+            <h2>Задачи по инциденту</h2>
           </div>
           <form onSubmit={handleCreateTask} style={{ marginBottom: "14px" }}>
             <div className="form-field">
@@ -684,13 +688,14 @@ export default function IncidentDetailPage({ incidentId, user, onBack }) {
               />
             </div>
             <div className="form-field">
-              <label htmlFor="task-desc">Детали</label>
+              <label htmlFor="task-desc">Детали *</label>
               <input
                 id="task-desc"
                 type="text"
                 value={taskDesc}
                 onChange={(e) => setTaskDesc(e.target.value)}
                 placeholder="Дополнительные указания"
+                required
               />
             </div>
             <div className="form-field">

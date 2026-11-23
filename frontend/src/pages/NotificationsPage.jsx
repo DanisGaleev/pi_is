@@ -15,6 +15,13 @@ const KIND_LABELS = {
   pdn_accounting_notice: 'ПДн: уведомление бухгалтерии',
 };
 
+function formatDateTime(value) {
+  if (!value) return '—';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  return d.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
+}
+
 export default function NotificationsPage({ onOpenIncident }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -189,7 +196,7 @@ export default function NotificationsPage({ onOpenIncident }) {
               <tbody>
                 {items.map((item) => (
                   <tr key={item.id}>
-                    <td style={{ whiteSpace: 'nowrap' }}>{item.created_at}</td>
+                    <td style={{ whiteSpace: 'nowrap' }}>{formatDateTime(item.created_at)}</td>
                     <td>
                       <span className="badge">{KIND_LABELS[item.kind] || item.kind}</span>
                     </td>

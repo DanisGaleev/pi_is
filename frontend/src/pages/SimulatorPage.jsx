@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { sendSignal } from '../api';
+import { useEffect, useState } from 'react';
+import { getDispatchRules, sendSignal } from '../api';
 
 const PRESETS = [
   {
@@ -117,15 +117,14 @@ const INCIDENT_TYPES = [
   'Подбор пароля',
   'Обман с платежами',
   'Уязвимость (CVE)',
-  'Сбой / Доступность',
   'Прочее',
 ];
 
 const SEVERITIES = [
-  { value: 'low', label: 'Низкая' },
-  { value: 'medium', label: 'Средняя' },
-  { value: 'high', label: 'Высокая' },
-  { value: 'critical', label: 'Критическая' },
+  { value: 'low', label: 'Низкий' },
+  { value: 'medium', label: 'Средний' },
+  { value: 'high', label: 'Высокий' },
+  { value: 'critical', label: 'Критический' },
 ];
 
 export default function SimulatorPage({ onOpenIncident }) {
@@ -133,6 +132,13 @@ export default function SimulatorPage({ onOpenIncident }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
+  const [dispatchRules, setDispatchRules] = useState([]);
+
+  useEffect(() => {
+    getDispatchRules()
+      .then((rules) => setDispatchRules(Array.isArray(rules) ? rules : []))
+      .catch(() => {});
+  }, []);
 
   function applyPreset(preset) {
     setForm({ ...preset.data });
@@ -333,6 +339,36 @@ export default function SimulatorPage({ onOpenIncident }) {
           </button>
         </form>
       </div>
+
+      {dispatchRules.length > 0 && (
+        <div className="card">
+          <div className="card-header">
+            <h2 style={{ margin: 0 }}>Правила автодиспетчеризации</h2>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Тип инцидента</th>
+                  <th>Важность по умолчанию</th>
+                  <th>Ответственная роль</th>
+                  <th>Описание</th>
+                </tr>
+              </thead>
+              <tbody>
+                {dispatchRules.map((rule) => (
+                  <tr key={rule.incident_type}>
+                    <td>{rule.incident_type}</td>
+                    <td>{rule.default_severity}</td>
+                    <td>{rule.responsible_role_label || rule.responsible_role}</td>
+                    <td className="muted">{rule.description}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
