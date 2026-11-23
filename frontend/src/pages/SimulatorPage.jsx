@@ -356,14 +356,23 @@ export default function SimulatorPage({ onOpenIncident }) {
                 </tr>
               </thead>
               <tbody>
-                {dispatchRules.map((rule) => (
-                  <tr key={rule.incident_type}>
-                    <td>{rule.incident_type}</td>
-                    <td>{rule.default_severity}</td>
-                    <td>{rule.responsible_role_label || rule.responsible_role}</td>
-                    <td className="muted">{rule.description}</td>
-                  </tr>
-                ))}
+                {dispatchRules.map((rule) => {
+                  const sevLabel =
+                    SEVERITIES.find((s) => s.value === rule.default_severity)?.label ||
+                    rule.default_severity;
+                  return (
+                    <tr key={rule.incident_type}>
+                      <td>{rule.incident_type}</td>
+                      <td>
+                        <span className={`badge severity-${rule.default_severity || 'medium'}`}>
+                          {sevLabel}
+                        </span>
+                      </td>
+                      <td>{rule.responsible_role_label || rule.responsible_role}</td>
+                      <td className="muted">{rule.description}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

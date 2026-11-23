@@ -30,6 +30,33 @@ const NAV_ITEMS = [
   { id: 'report', label: 'Отчёт' },
 ];
 
+function ShieldMark() {
+  return (
+    <span className="brand-mark" aria-hidden="true">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+      </svg>
+    </span>
+  );
+}
+
+function NavIcon({ id }) {
+  const props = { width: 16, height: 16, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 2, 'aria-hidden': true };
+  if (id === 'incidents') {
+    return <svg {...props}><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 10h18" /></svg>;
+  }
+  if (id === 'tasks') {
+    return <svg {...props}><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg>;
+  }
+  if (id === 'simulator') {
+    return <svg {...props}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12" /></svg>;
+  }
+  if (id === 'notifications') {
+    return <svg {...props}><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.73 21a2 2 0 0 1-3.46 0" /></svg>;
+  }
+  return <svg {...props}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>;
+}
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -105,7 +132,10 @@ export default function App() {
     return (
       <div className="login-wrap">
         <div className="login-card">
-          <h1>Учёт инцидентов ИБ</h1>
+          <div className="login-brand">
+            <ShieldMark />
+            <h1 style={{ margin: 0, fontSize: 19 }}>Учёт инцидентов ИБ</h1>
+          </div>
           <p className="muted" style={{ marginBottom: 16 }}>
             Войдите в систему для работы с инцидентами и задачами.
           </p>
@@ -169,9 +199,12 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <header className="topbar no-print">
-        <div className="topbar-inner">
-          <div className="brand">Учёт инцидентов ИБ</div>
+      <aside className="sidebar no-print">
+        <div className="sidebar-top">
+          <div className="brand">
+            <ShieldMark />
+            <span>Инциденты ИБ</span>
+          </div>
 
           <nav className="nav">
             {NAV_ITEMS.filter((item) => item.id !== 'tasks' || user.role !== 'lawyer').map((item) => (
@@ -186,22 +219,26 @@ export default function App() {
                   }
                 }}
               >
-                {item.label}
+                <NavIcon id={item.id} />
+                <span>{item.label}</span>
               </button>
             ))}
           </nav>
-
-          <div className="user-bar">
-            <span>{user.full_name}</span>
-            <span className="user-role">{ROLE_LABELS[user.role] || user.role}</span>
-            <button type="button" className="btn btn-sm" onClick={handleLogout}>
-              Выйти
-            </button>
-          </div>
         </div>
-      </header>
 
-      <main className="container">
+        <div className="user-card">
+          <div className="user-meta">
+            <span className="user-name">{user.full_name}</span>
+            <span className="user-role">{ROLE_LABELS[user.role] || user.role}</span>
+          </div>
+          <button type="button" className="btn btn-sm btn-logout" onClick={handleLogout}>
+            Выйти
+          </button>
+        </div>
+      </aside>
+
+      <div className="main-workspace">
+        <main className="container">
         {activeTab === 'incidents' &&
           (selectedIncidentId !== null ? (
             <IncidentDetailPage
@@ -222,7 +259,8 @@ export default function App() {
         {activeTab === 'simulator' && <SimulatorPage onOpenIncident={openIncident} />}
         {activeTab === 'notifications' && <NotificationsPage onOpenIncident={openIncident} />}
         {activeTab === 'report' && <ReportPage />}
-      </main>
+        </main>
+      </div>
     </div>
   );
 }

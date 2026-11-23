@@ -127,11 +127,13 @@ export default function TasksPage({ user, onOpenIncident }) {
                   const done = isDone(task.status);
                   return (
                     <tr key={task.id}>
-                      <td>#{task.id}</td>
+                      <td className="mono">#{task.id}</td>
                       <td>
                         <button
                           type="button"
                           className="btn btn-sm"
+                          title={`#${task.incident_id} ${task.incident_title || 'Открыть'}`}
+                          style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', display: 'inline-block' }}
                           onClick={() => onOpenIncident && onOpenIncident(task.incident_id)}
                         >
                           #{task.incident_id} {task.incident_title || 'Открыть'}
@@ -141,9 +143,15 @@ export default function TasksPage({ user, onOpenIncident }) {
                         <div style={{ fontWeight: 600 }}>{task.title}</div>
                         {task.description && <div className="muted">{task.description}</div>}
                       </td>
-                      <td style={{ minWidth: 180 }}>
+                      <td style={{ width: 165, minWidth: 150 }}>
                         <select
                           value={task.assigned_to || ''}
+                          title={
+                            assignableUsers.find((u) => u.id === task.assigned_to)?.label ||
+                            task.assigned_to_user?.label ||
+                            ''
+                          }
+                          style={{ fontSize: '12.5px', padding: '6px 8px' }}
                           onChange={(e) => handleReassign(task, e.target.value)}
                           disabled={done || reassigningId === task.id}
                         >
@@ -164,10 +172,11 @@ export default function TasksPage({ user, onOpenIncident }) {
                           {task.status}
                         </span>
                       </td>
-                      <td style={{ minWidth: 220 }}>
+                      <td style={{ minWidth: 135 }}>
                         <input
                           type="text"
                           value={results[task.id] ?? ''}
+                          title={results[task.id] ?? ''}
                           onChange={(e) =>
                             setResults((prev) => ({ ...prev, [task.id]: e.target.value }))
                           }
@@ -185,7 +194,7 @@ export default function TasksPage({ user, onOpenIncident }) {
                             disabled={savingId === task.id}
                             onClick={() => handleComplete(task)}
                           >
-                            {savingId === task.id ? 'Сохранение...' : 'Завершить задачу'}
+                            {savingId === task.id ? 'Сохранение...' : 'Завершить'}
                           </button>
                         )}
                       </td>
