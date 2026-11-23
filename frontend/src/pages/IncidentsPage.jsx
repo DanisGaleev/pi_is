@@ -86,8 +86,13 @@ export default function IncidentsPage({ user, onOpenIncident }) {
     has_personal_data: false,
   });
 
-  const isSysadmin = user?.role === "sysadmin";
   const isLawyer = user?.role === "lawyer";
+  const canCreatePdn = [
+    "ib_specialist",
+    "it_head",
+    "director",
+    "chief_accountant",
+  ].includes(user?.role);
 
   function currentFilters() {
     return { q, incident_type: incidentType, status, sort_by: sortBy, sort_order: sortOrder };
@@ -146,7 +151,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
         computer: form.computer.trim(),
         employee: form.employee.trim(),
         source: "manual",
-        has_personal_data: isSysadmin ? 0 : form.has_personal_data ? 1 : 0,
+        has_personal_data: canCreatePdn && form.has_personal_data ? 1 : 0,
       });
       setForm({
         title: "",
@@ -286,7 +291,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
                   placeholder="ФИО сотрудника"
                 />
               </div>
-              {!isSysadmin && (
+              {canCreatePdn && (
                 <div className="form-field" style={{ justifyContent: "flex-end" }}>
                   <label className="checkbox-label">
                     <input

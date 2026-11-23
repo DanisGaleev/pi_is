@@ -57,6 +57,14 @@ function NavIcon({ id }) {
   return <svg {...props}><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><polyline points="14 2 14 8 20 8" /></svg>;
 }
 
+const OPERATIONAL_ROLES = new Set(['ib_specialist', 'sysadmin', 'it_head']);
+
+function canSeeNavItem(itemId, role) {
+  if (itemId === 'tasks') return role !== 'lawyer';
+  if (itemId === 'simulator') return OPERATIONAL_ROLES.has(role);
+  return true;
+}
+
 export default function App() {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -207,7 +215,7 @@ export default function App() {
           </div>
 
           <nav className="nav">
-            {NAV_ITEMS.filter((item) => item.id !== 'tasks' || user.role !== 'lawyer').map((item) => (
+            {NAV_ITEMS.filter((item) => canSeeNavItem(item.id, user.role)).map((item) => (
               <button
                 key={item.id}
                 type="button"
@@ -256,7 +264,9 @@ export default function App() {
         {activeTab === 'tasks' && user.role !== 'lawyer' && (
           <TasksPage user={user} onOpenIncident={openIncident} />
         )}
-        {activeTab === 'simulator' && <SimulatorPage onOpenIncident={openIncident} />}
+        {activeTab === 'simulator' && OPERATIONAL_ROLES.has(user.role) && (
+          <SimulatorPage user={user} onOpenIncident={openIncident} />
+        )}
         {activeTab === 'notifications' && <NotificationsPage onOpenIncident={openIncident} />}
         {activeTab === 'report' && <ReportPage />}
         </main>
