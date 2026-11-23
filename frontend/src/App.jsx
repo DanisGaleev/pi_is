@@ -1,3 +1,4 @@
+
 import { useEffect, useState } from 'react';
 import { clearToken, getMe, getToken, login, setToken } from './api';
 import IncidentDetailPage from './pages/IncidentDetailPage';
@@ -173,7 +174,7 @@ export default function App() {
           <div className="brand">Учёт инцидентов ИБ</div>
 
           <nav className="nav">
-            {NAV_ITEMS.map((item) => (
+            {NAV_ITEMS.filter((item) => item.id !== 'tasks' || user.role !== 'lawyer').map((item) => (
               <button
                 key={item.id}
                 type="button"
@@ -215,7 +216,9 @@ export default function App() {
             />
           ))}
 
-        {activeTab === 'tasks' && <TasksPage user={user} onOpenIncident={openIncident} />}
+        {activeTab === 'tasks' && user.role !== 'lawyer' && (
+          <TasksPage user={user} onOpenIncident={openIncident} />
+        )}
         {activeTab === 'simulator' && <SimulatorPage onOpenIncident={openIncident} />}
         {activeTab === 'notifications' && <NotificationsPage onOpenIncident={openIncident} />}
         {activeTab === 'report' && <ReportPage />}

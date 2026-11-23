@@ -6,7 +6,17 @@ const INCIDENT_TYPES = [
   "Утечка ПДн",
   "Фишинг",
   "Несанкционированный доступ",
+  "Подбор пароля",
+  "Обман с платежами",
+  "Уязвимость (CVE)",
   "Прочее",
+];
+
+const SORT_FIELDS = [
+  { value: "severity", label: "Важность" },
+  { value: "detected_at", label: "Дата обнаружения" },
+  { value: "created_at", label: "Дата создания" },
+  { value: "id", label: "ID" },
 ];
 
 const SEVERITIES = [
@@ -60,6 +70,8 @@ export default function IncidentsPage({ user, onOpenIncident }) {
   const [q, setQ] = useState("");
   const [incidentType, setIncidentType] = useState("");
   const [status, setStatus] = useState("");
+  const [sortBy, setSortBy] = useState("severity");
+  const [sortOrder, setSortOrder] = useState("desc");
 
   const [showForm, setShowForm] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -75,8 +87,13 @@ export default function IncidentsPage({ user, onOpenIncident }) {
   });
 
   const isSysadmin = user?.role === "sysadmin";
+  const isLawyer = user?.role === "lawyer";
 
-  async function loadIncidents(filters = { q, incident_type: incidentType, status }) {
+  function currentFilters() {
+    return { q, incident_type: incidentType, status, sort_by: sortBy, sort_order: sortOrder };
+  }
+
+  async function loadIncidents(filters = currentFilters()) {
     setLoading(true);
     setError("");
     try {
@@ -90,25 +107,33 @@ export default function IncidentsPage({ user, onOpenIncident }) {
   }
 
   useEffect(() => {
-    loadIncidents({ q, incident_type: incidentType, status });
-  }, [incidentType, status]);
+    loadIncidents({ q, incident_type: incidentType, status, sort_by: sortBy, sort_order: sortOrder });
+  }, [incidentType, status, sortBy, sortOrder]);
 
   function handleSearchSubmit(e) {
     e.preventDefault();
-    loadIncidents({ q, incident_type: incidentType, status });
+    loadIncidents(currentFilters());
   }
 
   function handleResetFilters() {
     setQ("");
     setIncidentType("");
     setStatus("");
-    loadIncidents({ q: "", incident_type: "", status: "" });
+    loadIncidents({ q: "", incident_type: "", status: "", sort_by: sortBy, sort_order: sortOrder });
   }
 
   async function handleCreateSubmit(e) {
     e.preventDefault();
     if (!form.title.trim()) {
       setFormError("Укажите заголовок инцидента");
+      return;
+    }
+    if (!form.description.trim()) {
+      setFormError("Укажите описание инцидента");
+      return;
+    }
+    if (!form.incident_type) {
+      setFormError("Выберите тип инцидента");
       return;
     }
     setSubmitting(true);
@@ -120,6 +145,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
         description: form.description.trim(),
         computer: form.computer.trim(),
         employee: form.employee.trim(),
+        source: "manual",
         has_personal_data: isSysadmin ? 0 : form.has_personal_data ? 1 : 0,
       });
       setForm({
@@ -149,16 +175,18 @@ export default function IncidentsPage({ user, onOpenIncident }) {
             Реестр инцидентов информационной безопасности
           </div>
         </div>
-        <button
-          type="button"
-          className="btn btn-primary"
-          onClick={() => setShowForm((v) => !v)}
-        >
-          {showForm ? "Скрыть форму" : "Зарегистрировать инцидент"}
-        </button>
+        {!isLawyer && (
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={() => setShowForm((v) => !v)}
+          >
+            {showForm ? "Скрыть форму" : "Зарегистрировать инцидент"}
+          </button>
+        )}
       </div>
 
-      {showForm && (
+      {showForm && !isLawyer && (
         <div className="card">
           <div className="card-header">
             <h2>Ручная регистрация инцидента</h2>
@@ -260,6 +288,7 @@ export default function IncidentsPage({ user, onOpenIncident }) {
                   setForm({ ...form, description: e.target.value })
                 }
                 placeholder="Подробности обнаружения и контекст"
+                required
               />
             </div>
             <div style={{ display: "flex", gap: "8px", marginTop: "8px" }}>
@@ -314,6 +343,25 @@ export default function IncidentsPage({ user, onOpenIncident }) {
                 {s}
               </option>
             ))}
+          </select>
+          <select
+            value={sortBy}
+            onChange={(e) => setSortBy(e.target.value)}
+            style={{ maxWidth: "180px" }}
+          >
+            {SORT_FIELDS.map((s) => (
+              <option key={s.value} value={s.value}>
+                Сорт.: {s.label}
+              </option>
+            ))}
+          </select>
+          <select
+            value={sortOrder}
+            onChange={(e) => setSortOrder(e.target.value)}
+            style={{ maxWidth: "140px" }}
+          >
+            <option value="desc">По убыванию</option>
+            <option value="asc">По возрастанию</option>
           </select>
           <button type="submit" className="btn btn-dark">
             Найти

@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { sendSignal } from '../api';
+import { useEffect, useState } from 'react';
+import { getDispatchRules, sendSignal } from '../api';
 
 const PRESETS = [
   {
@@ -13,6 +13,7 @@ const PRESETS = [
       severity: 'high',
       incident_key: 'ksc-ws-fin-04-trojan',
       has_personal_data: true,
+      error_code: '',
       body: 'Обнаружен и заблокирован объект Trojan.Win32.Agent в каталоге Загрузки пользователя.',
     },
   },
@@ -27,6 +28,7 @@ const PRESETS = [
       severity: 'critical',
       incident_key: 'zbx-srv-db-01-high-load',
       has_personal_data: false,
+      error_code: '',
       body: 'Аномальная загрузка CPU (98%) и всплеск сетевых соединений на SRV-DB-01.',
     },
   },
@@ -41,6 +43,7 @@ const PRESETS = [
       severity: 'medium',
       incident_key: 'mail-phish-hr-12',
       has_personal_data: true,
+      error_code: '',
       body: 'Сотрудник переслал подозрительное письмо с вложением Счет_оплата.html и запросом пароля.',
     },
   },
@@ -55,7 +58,53 @@ const PRESETS = [
       severity: 'high',
       incident_key: 'tg-sales-07-rdp',
       has_personal_data: false,
+      error_code: '',
       body: 'Зафиксированы множественные неудачные попытки входа по RDP с внешнего адреса.',
+    },
+  },
+  {
+    label: 'CVE',
+    data: {
+      source: 'Сканер уязвимостей',
+      sender: 'vuln-scanner@corp.local',
+      computer: 'SRV-WEB-02',
+      employee: '',
+      incident_type: '',
+      severity: 'high',
+      incident_key: 'scanner-srv-web-02-cve',
+      has_personal_data: false,
+      error_code: 'CVE-2024-3400',
+      body: 'Сканер уязвимостей обнаружил критическую уязвимость CVE-2024-3400 на SRV-WEB-02, требуется обновление.',
+    },
+  },
+  {
+    label: 'Подбор пароля',
+    data: {
+      source: 'AD',
+      sender: 'ad-monitor@corp.local',
+      computer: 'SRV-AD-01',
+      employee: '',
+      incident_type: '',
+      severity: 'high',
+      incident_key: 'ad-srv-ad-01-bruteforce',
+      has_personal_data: false,
+      error_code: 'AUTH_BRUTEFORCE',
+      body: 'Зафиксирован подбор пароля (bruteforce) учётной записи администратора домена, 200+ неудачных попыток входа.',
+    },
+  },
+  {
+    label: 'Обман с платежами',
+    data: {
+      source: 'Бухгалтерия',
+      sender: 'buh@corp.local',
+      computer: '',
+      employee: 'Кузнецова О.И.',
+      incident_type: '',
+      severity: 'high',
+      incident_key: 'buh-payment-fraud',
+      has_personal_data: false,
+      error_code: '',
+      body: 'Получено письмо с измененными платежными реквизитами поставщика, подозрение на обман с платежами (BEC).',
     },
   },
 ];
@@ -65,15 +114,17 @@ const INCIDENT_TYPES = [
   'Фишинг',
   'Несанкционированный доступ',
   'Утечка ПДн',
-  'Сбой / Доступность',
+  'Подбор пароля',
+  'Обман с платежами',
+  'Уязвимость (CVE)',
   'Прочее',
 ];
 
 const SEVERITIES = [
-  { value: 'low', label: 'Низкая' },
-  { value: 'medium', label: 'Средняя' },
-  { value: 'high', label: 'Высокая' },
-  { value: 'critical', label: 'Критическая' },
+  { value: 'low', label: 'Низкий' },
+  { value: 'medium', label: 'Средний' },
+  { value: 'high', label: 'Высокий' },
+  { value: 'critical', label: 'Критический' },
 ];
 
 export default function SimulatorPage({ onOpenIncident }) {
@@ -81,6 +132,13 @@ export default function SimulatorPage({ onOpenIncident }) {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
+  const [dispatchRules, setDispatchRules] = useState([]);
+
+  useEffect(() => {
+    getDispatchRules()
+      .then((rules) => setDispatchRules(Array.isArray(rules) ? rules : []))
+      .catch(() => {});
+  }, []);
 
   function applyPreset(preset) {
     setForm({ ...preset.data });
@@ -209,12 +267,24 @@ export default function SimulatorPage({ onOpenIncident }) {
                 value={form.incident_type}
                 onChange={(e) => updateField('incident_type', e.target.value)}
               >
+                <option value="">— Автоклассификация по error_code/тексту —</option>
                 {INCIDENT_TYPES.map((t) => (
                   <option key={t} value={t}>
                     {t}
                   </option>
                 ))}
               </select>
+            </div>
+
+            <div className="form-field">
+              <label htmlFor="sig-error-code">Код ошибки (error_code)</label>
+              <input
+                id="sig-error-code"
+                type="text"
+                value={form.error_code || ''}
+                onChange={(e) => updateField('error_code', e.target.value)}
+                placeholder="Например, CVE-2024-3400 или AUTH_BRUTEFORCE"
+              />
             </div>
 
             <div className="form-field">
@@ -269,6 +339,36 @@ export default function SimulatorPage({ onOpenIncident }) {
           </button>
         </form>
       </div>
+
+      {dispatchRules.length > 0 && (
+        <div className="card">
+          <div className="card-header">
+            <h2 style={{ margin: 0 }}>Правила автодиспетчеризации</h2>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Тип инцидента</th>
+                  <th>Важность по умолчанию</th>
+                  <th>Ответственная роль</th>
+                  <th>Описание</th>
+                </tr>
+              </thead>
+              <tbody>
+                {dispatchRules.map((rule) => (
+                  <tr key={rule.incident_type}>
+                    <td>{rule.incident_type}</td>
+                    <td>{rule.default_severity}</td>
+                    <td>{rule.responsible_role_label || rule.responsible_role}</td>
+                    <td className="muted">{rule.description}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -260,6 +260,8 @@ h3 { font-size: 14px; }
 input[type="text"],
 input[type="password"],
 input[type="number"],
+input[type="date"],
+input[type="datetime-local"],
 select,
 textarea {
   width: 100%;

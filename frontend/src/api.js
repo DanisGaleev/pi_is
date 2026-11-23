@@ -117,6 +117,10 @@ export function updateStep(incidentId, stepIndex, completed) {
   });
 }
 
+export function listUsers(params = {}) {
+  return request(`/api/users${toQuery(params)}`);
+}
+
 export function createTask(incidentId, data) {
   return request(`/api/incidents/${incidentId}/tasks`, {
     method: 'POST',
@@ -146,16 +150,31 @@ export function updateRkn(incidentId, rknDraft) {
   });
 }
 
+export function confirmRkn(incidentId, confirmation) {
+  return request(`/api/incidents/${incidentId}/rkn/confirm`, {
+    method: 'POST',
+    body: { confirmation: confirmation || '' },
+  });
+}
+
+export function getDispatchRules() {
+  return request('/api/incidents/dispatch-rules');
+}
+
 export function checkEscalations() {
   return request('/api/escalations/check', {
     method: 'POST',
   });
 }
 
-export function listNotifications(recipientRole) {
-  return request(`/api/notifications${toQuery({ recipient_role: recipientRole })}`);
+export function listNotifications(params = {}) {
+  return request(`/api/notifications${toQuery(params)}`);
 }
 
 export function getMonthlyReport(year, month) {
   return request(`/api/reports/monthly${toQuery({ year, month })}`);
+}
+
+export function getByTypeReport(year, month) {
+  return request(`/api/reports/by-type${toQuery({ year, month })}`);
 }
