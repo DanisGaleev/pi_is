@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -234,6 +235,23 @@ class InstructionProgress:
         }
 
 
+MAX_TASK_ASSIGNEES = 3
+
+
+def _normalize_assignee_ids(user_ids: Iterable[int]) -> list[int]:
+    """Deduplicate task assignee IDs preserving order and validate limit."""
+    unique: list[int] = []
+    seen: set[int] = set()
+    for uid in user_ids:
+        uid_int = int(uid)
+        if uid_int not in seen:
+            seen.add(uid_int)
+            unique.append(uid_int)
+    if len(unique) > MAX_TASK_ASSIGNEES:
+        raise ValueError(f"На задачу можно назначить не более {MAX_TASK_ASSIGNEES} исполнителей")
+    return unique
+
+
 @dataclass
 class Task:
     """Remediation or investigation task assigned under an incident."""
@@ -249,6 +267,44 @@ class Task:
     created_at: str
     completed_at: str | None = None
     due_date: str | None = None
+    assignee_ids: list[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.assignee_ids:
+            self.assignee_ids = _normalize_assignee_ids(self.assignee_ids)
+            self.assigned_to = self.assignee_ids[0]
+        elif self.assigned_to is not None:
+            self.assigned_to = int(self.assigned_to)
+            self.assignee_ids = [self.assigned_to]
+        else:
+            self.assignee_ids = []
+
+    def set_assignees(self, user_ids: Iterable[int]) -> None:
+        """Replace task assignees (up to MAX_TASK_ASSIGNEES) and sync primary assigned_to."""
+        self.assignee_ids = _normalize_assignee_ids(user_ids)
+        self.assigned_to = self.assignee_ids[0] if self.assignee_ids else None
+
+    def add_assignee(self, user_id: int) -> bool:
+        """Add an assignee if absent and below MAX_TASK_ASSIGNEES; return True if added."""
+        uid = int(user_id)
+        if uid in self.assignee_ids:
+            return False
+        if len(self.assignee_ids) >= MAX_TASK_ASSIGNEES:
+            raise ValueError(
+                f"На задачу можно назначить не более {MAX_TASK_ASSIGNEES} исполнителей"
+            )
+        self.assignee_ids = [*self.assignee_ids, uid]
+        self.assigned_to = self.assignee_ids[0]
+        return True
+
+    def remove_assignee(self, user_id: int) -> bool:
+        """Remove an assignee if present and sync primary assigned_to; return True if removed."""
+        uid = int(user_id)
+        if uid not in self.assignee_ids:
+            return False
+        self.assignee_ids = [existing for existing in self.assignee_ids if existing != uid]
+        self.assigned_to = self.assignee_ids[0] if self.assignee_ids else None
+        return True
 
     def complete(self, result: str, completed_at: str) -> None:
         """Mark the task as completed with an outcome summary."""
@@ -275,6 +331,7 @@ class Task:
             "title": self.title,
             "description": self.description,
             "assigned_to": self.assigned_to,
+            "assignee_ids": list(self.assignee_ids),
             "status": self.status,
             "result": self.result,
             "created_by": self.created_by,

@@ -2,7 +2,15 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from app.domain.models import Deadlines, Incident, RegulatorNotice, ReportFile, User
+from app.domain.models import (
+    MAX_TASK_ASSIGNEES,
+    Deadlines,
+    Incident,
+    RegulatorNotice,
+    ReportFile,
+    Task,
+    User,
+)
 from app.enums import (
     Channel,
     DeliveryStatus,
@@ -108,7 +116,7 @@ class InstructionService:
 
 
 class TaskService:
-    """Task assignment, listing, completion, and overdue monitoring."""
+    """Task assignment (up to 3 assignees), listing, completion, and overdue monitoring."""
 
     def __init__(
         self,
@@ -126,7 +134,7 @@ class TaskService:
 
     def _validate_assignee(self, assigned_to: Any) -> User:
         """Validate that an explicit assignee ID belongs to an existing active user."""
-        if isinstance(assigned_to, bool) or not isinstance(assigned_to, int):
+        if isinstance(assigned_to, bool) or not isinstance(assigned_to, int) or assigned_to <= 0:
             raise ValidationError("Некорректный идентификатор исполнителя")
         assignee = self.user_repo.get_by_id(assigned_to)
         if assignee is None:
@@ -134,6 +142,104 @@ class TaskService:
         if not assignee.active:
             raise ValidationError("Нельзя назначить задачу неактивному пользователю")
         return assignee
+
+    def _validate_assignee_ids(
+        self,
+        raw_ids: Any,
+        *,
+        allow_empty: bool = False,
+    ) -> list[int]:
+        """Validate a sequence of 0..3 (or 1..3) unique active assignee IDs."""
+        if not isinstance(raw_ids, (list, tuple)):
+            raise ValidationError("Поле 'assignee_ids' должно быть списком идентификаторов пользователей")
+        unique_ids: list[int] = []
+        seen: set[int] = set()
+        for raw_id in raw_ids:
+            assignee = self._validate_assignee(raw_id)
+            if assignee.id not in seen:
+                seen.add(assignee.id)
+                unique_ids.append(assignee.id)
+        if len(unique_ids) > MAX_TASK_ASSIGNEES:
+            raise ValidationError(
+                f"На задачу можно назначить не более {MAX_TASK_ASSIGNEES} исполнителей"
+            )
+        if not allow_empty and not unique_ids:
+            raise ValidationError("Необходимо назначить хотя бы одного исполнителя")
+        return unique_ids
+
+    def _resolve_assignees_payload(
+        self,
+        data: Mapping[str, Any],
+        *,
+        allow_empty: bool,
+    ) -> list[int]:
+        """Resolve assignee_ids and/or legacy assigned_to fields consistently."""
+        has_list = "assignee_ids" in data
+        has_single = "assigned_to" in data
+
+        if has_list and data["assignee_ids"] is not None:
+            ids = self._validate_assignee_ids(data["assignee_ids"], allow_empty=allow_empty)
+            if has_single and data["assigned_to"] is not None:
+                primary = self._validate_assignee(data["assigned_to"]).id
+                if primary not in ids:
+                    raise ValidationError("Поля 'assigned_to' и 'assignee_ids' конфликтуют")
+            return ids
+
+        if has_list and data["assignee_ids"] is None:
+            if not allow_empty:
+                if has_single and data["assigned_to"] is not None:
+                    return [self._validate_assignee(require_positive_int(data["assigned_to"], "assigned_to")).id]
+                raise ValidationError("Необходимо назначить хотя бы одного исполнителя")
+            if has_single and data["assigned_to"] is not None:
+                raise ValidationError("Поля 'assigned_to' и 'assignee_ids' конфликтуют")
+            return []
+
+        if has_single:
+            raw_assigned = data["assigned_to"]
+            if raw_assigned is None:
+                if not allow_empty:
+                    raise ValidationError("Поле 'assigned_to' должно быть положительным целым числом")
+                return []
+            if not allow_empty:
+                require_positive_int(raw_assigned, "assigned_to")
+            return [self._validate_assignee(raw_assigned).id]
+
+        raise ValidationError("Необходимо указать исполнителя задачи")
+
+    @staticmethod
+    def _format_assignee_history(assignee_ids: list[int]) -> str:
+        if not assignee_ids:
+            return "исполнитель снят"
+        if len(assignee_ids) == 1:
+            return f"исполнитель #{assignee_ids[0]}"
+        return "исполнители: " + ", ".join(f"#{uid}" for uid in assignee_ids)
+
+    def _load_editable_task(
+        self,
+        user: User | Mapping[str, Any],
+        task_id: int,
+        *,
+        action: str = "edit_denied",
+        detail: str = "Изменение задач запрещено",
+    ) -> tuple[User, Task]:
+        """Verify operational RBAC, task existence, and PDn visibility."""
+        actor = coerce_user(user)
+        self.access_control.assert_operational_access(
+            actor,
+            "task",
+            task_id,
+            action=action,
+            detail=detail,
+        )
+        found = self.task_repo.get_with_incident_pdn(task_id)
+        if found is None:
+            raise NotFoundError("Задача не найдена")
+
+        task, has_pd = found
+        if PdnFlag.from_bool_int(has_pd) is PdnFlag.YES and not self.access_control.can_view_pdn(actor):
+            self.access_control.log_access(actor.id, "task", task_id, "access_denied")
+            raise AccessDeniedError("Доступ к задачам по инцидентам с ПДн запрещен")
+        return actor, task
 
     def create_task(
         self,
@@ -160,8 +266,7 @@ class TaskService:
 
         title = require_non_blank(data.get("title"), "title")
         description = require_non_blank(data.get("description"), "description")
-        assigned_to = require_positive_int(data.get("assigned_to"), "assigned_to")
-        assigned_to = self._validate_assignee(assigned_to).id
+        assignee_ids = self._resolve_assignees_payload(data, allow_empty=False)
         due_date = require_iso_datetime(data.get("due_date"), "due_date")
 
         now = utc_now()
@@ -169,7 +274,8 @@ class TaskService:
             incident_id=incident_id,
             title=title,
             description=description,
-            assigned_to=assigned_to,
+            assigned_to=assignee_ids[0],
+            assignee_ids=assignee_ids,
             created_by=actor.id,
             created_at=now,
             due_date=due_date,
@@ -218,23 +324,8 @@ class TaskService:
         task_id: int,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        """Update task status, result, assignee, or due date with RBAC and PDn check."""
-        actor = coerce_user(user)
-        self.access_control.assert_operational_access(
-            actor,
-            "task",
-            task_id,
-            action="edit_denied",
-            detail="Изменение задач запрещено",
-        )
-        found = self.task_repo.get_with_incident_pdn(task_id)
-        if found is None:
-            raise NotFoundError("Задача не найдена")
-
-        task, has_pd = found
-        if PdnFlag.from_bool_int(has_pd) is PdnFlag.YES and not self.access_control.can_view_pdn(actor):
-            self.access_control.log_access(actor.id, "task", task_id, "access_denied")
-            raise AccessDeniedError("Доступ к задачам по инцидентам с ПДн запрещен")
+        """Update task status, result, assignees, or due date with RBAC and PDn check."""
+        actor, task = self._load_editable_task(user, task_id)
 
         if not isinstance(data, Mapping):
             raise ValidationError("Данные обновления задачи должны быть словарём")
@@ -246,13 +337,11 @@ class TaskService:
             raise ValidationError("Поле 'result' должно быть строкой")
         if "due_date" in data:
             task.due_date = require_iso_datetime(data["due_date"], "due_date")
+
         reassigned = False
-        if "assigned_to" in data:
-            raw_assigned = data["assigned_to"]
-            if raw_assigned is not None:
-                task.assigned_to = self._validate_assignee(raw_assigned).id
-            else:
-                task.assigned_to = None
+        if "assignee_ids" in data or "assigned_to" in data:
+            new_assignee_ids = self._resolve_assignees_payload(data, allow_empty=True)
+            task.set_assignees(new_assignee_ids)
             reassigned = True
 
         if raw_status is not None:
@@ -278,17 +367,86 @@ class TaskService:
         updated = self.task_repo.update(task)
         details_parts = [f"Задача #{task_id}: статус '{updated.status}'"]
         if reassigned:
-            details_parts.append(
-                f"исполнитель #{updated.assigned_to}"
-                if updated.assigned_to is not None
-                else "исполнитель снят"
-            )
+            details_parts.append(self._format_assignee_history(updated.assignee_ids))
         self.history_repo.add(
             incident_id=updated.incident_id,
             user_id=actor.id,
             action="task_updated",
             details=", ".join(details_parts),
             created_at=now,
+        )
+        self.access_control.log_access(actor.id, "task", task_id, "update")
+        return enrich_tasks_with_users([updated], self.user_repo)[0]
+
+    def set_assignees(
+        self,
+        user: User | Mapping[str, Any],
+        task_id: int,
+        assignee_ids: list[int] | None,
+    ) -> dict[str, Any]:
+        """Replace the full list of task assignees (0..3 active users)."""
+        actor, task = self._load_editable_task(user, task_id)
+        raw_list = [] if assignee_ids is None else assignee_ids
+        validated_ids = self._validate_assignee_ids(raw_list, allow_empty=True)
+        task.set_assignees(validated_ids)
+        updated = self.task_repo.update(task)
+        now = utc_now()
+        self.history_repo.add(
+            incident_id=updated.incident_id,
+            user_id=actor.id,
+            action="task_updated",
+            details=f"Задача #{task_id}: {self._format_assignee_history(updated.assignee_ids)}",
+            created_at=now,
+        )
+        self.access_control.log_access(actor.id, "task", task_id, "update")
+        return enrich_tasks_with_users([updated], self.user_repo)[0]
+
+    def add_assignee(
+        self,
+        user: User | Mapping[str, Any],
+        task_id: int,
+        user_id: Any,
+    ) -> dict[str, Any]:
+        """Add an active assignee to a task if not already assigned and below MAX_TASK_ASSIGNEES."""
+        actor, task = self._load_editable_task(user, task_id)
+        assignee = self._validate_assignee(user_id)
+        try:
+            added = task.add_assignee(assignee.id)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+
+        if added:
+            updated = self.task_repo.update(task)
+            self.history_repo.add(
+                incident_id=updated.incident_id,
+                user_id=actor.id,
+                action="task_updated",
+                details=f"Задача #{task_id}: добавлен исполнитель #{assignee.id}",
+                created_at=utc_now(),
+            )
+        else:
+            updated = task
+        self.access_control.log_access(actor.id, "task", task_id, "update")
+        return enrich_tasks_with_users([updated], self.user_repo)[0]
+
+    def remove_assignee(
+        self,
+        user: User | Mapping[str, Any],
+        task_id: int,
+        user_id: int,
+    ) -> dict[str, Any]:
+        """Remove an assignee from a task, shifting primary assigned_to to the next assignee."""
+        actor, task = self._load_editable_task(user, task_id)
+        target_id = require_positive_int(user_id, "user_id")
+        if not task.remove_assignee(target_id):
+            raise NotFoundError("Исполнитель не назначен на эту задачу")
+        updated = self.task_repo.update(task)
+        self.history_repo.add(
+            incident_id=updated.incident_id,
+            user_id=actor.id,
+            action="task_updated",
+            details=f"Задача #{task_id}: снят исполнитель #{target_id}",
+            created_at=utc_now(),
         )
         self.access_control.log_access(actor.id, "task", task_id, "update")
         return enrich_tasks_with_users([updated], self.user_repo)[0]

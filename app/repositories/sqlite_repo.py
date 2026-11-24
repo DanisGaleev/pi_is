@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.domain.models import (
+    MAX_TASK_ASSIGNEES,
     AuditRecord,
     HistoryRecord,
     Incident,
@@ -173,6 +174,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     due_date TEXT
 );
 
+CREATE TABLE IF NOT EXISTS task_assignees (
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0,
+    assigned_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_assignees_user_id ON task_assignees(user_id);
+
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id INTEGER REFERENCES incidents(id) ON DELETE CASCADE,
@@ -224,7 +235,7 @@ _COLUMN_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
-    """Safely add missing UML columns to pre-existing SQLite tables."""
+    """Safely add missing UML columns and backfill relational tables on pre-existing SQLite DBs."""
     for table, columns in _COLUMN_MIGRATIONS.items():
         existing = {
             row["name"]
@@ -233,6 +244,18 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         for col_name, col_def in columns:
             if col_name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO task_assignees (task_id, user_id, position, assigned_at)
+        SELECT id, assigned_to, 0, created_at
+        FROM tasks
+        WHERE assigned_to IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM task_assignees ta WHERE ta.task_id = tasks.id
+          )
+        """
+    )
 
 
 def _seed(conn: sqlite3.Connection) -> None:
@@ -512,7 +535,7 @@ def _row_to_incident(row: sqlite3.Row) -> Incident:
     )
 
 
-def _row_to_task(row: sqlite3.Row) -> Task:
+def _row_to_task(row: sqlite3.Row, assignee_ids: Iterable[int] | None = None) -> Task:
     keys = row.keys()
     return Task(
         id=row["id"],
@@ -526,6 +549,7 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         created_at=row["created_at"],
         completed_at=row["completed_at"],
         due_date=row["due_date"] if "due_date" in keys else None,
+        assignee_ids=list(assignee_ids) if assignee_ids is not None else [],
     )
 
 
@@ -1190,16 +1214,86 @@ class InstructionRepository(_BaseRepository):
 
 
 class TaskRepository(_BaseRepository):
-    """Persistence operations for incident tasks."""
+    """Persistence operations for incident tasks and their multi-assignee links."""
+
+    @staticmethod
+    def _load_assignees_map(
+        conn: sqlite3.Connection,
+        task_ids: Iterable[int],
+    ) -> dict[int, list[int]]:
+        unique_ids = sorted({int(tid) for tid in task_ids})
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        rows = conn.execute(
+            f"""
+            SELECT task_id, user_id
+            FROM task_assignees
+            WHERE task_id IN ({placeholders})
+            ORDER BY task_id ASC, position ASC, user_id ASC
+            """,
+            unique_ids,
+        ).fetchall()
+        mapping: dict[int, list[int]] = {}
+        for row in rows:
+            mapping.setdefault(int(row["task_id"]), []).append(int(row["user_id"]))
+        return mapping
+
+    @staticmethod
+    def _sync_assignees(
+        conn: sqlite3.Connection,
+        task_id: int,
+        assignee_ids: Iterable[int],
+        assigned_at: str,
+    ) -> None:
+        conn.execute("DELETE FROM task_assignees WHERE task_id = ?", (task_id,))
+        entries = [
+            (task_id, int(user_id), pos, assigned_at)
+            for pos, user_id in enumerate(assignee_ids)
+        ]
+        if entries:
+            conn.executemany(
+                """
+                INSERT INTO task_assignees (task_id, user_id, position, assigned_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                entries,
+            )
+
+    @staticmethod
+    def _resolve_assignee_ids(
+        assigned_to: int | None,
+        assignee_ids: Iterable[int] | None,
+    ) -> list[int]:
+        raw = (
+            list(assignee_ids)
+            if assignee_ids is not None
+            else ([assigned_to] if assigned_to is not None else [])
+        )
+        unique: list[int] = []
+        seen: set[int] = set()
+        for uid in raw:
+            uid_int = int(uid)
+            if uid_int not in seen:
+                seen.add(uid_int)
+                unique.append(uid_int)
+        if len(unique) > MAX_TASK_ASSIGNEES:
+            raise ValueError(
+                f"На задачу можно назначить не более {MAX_TASK_ASSIGNEES} исполнителей"
+            )
+        return unique
 
     def get_by_id(self, task_id: int) -> Task | None:
-        """Fetch a task by ID."""
+        """Fetch a task by ID along with its ordered assignee IDs."""
         with self.db.connection() as conn:
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-            return _row_to_task(row) if row is not None else None
+            if row is None:
+                return None
+            assignees_map = self._load_assignees_map(conn, [task_id])
+            return _row_to_task(row, assignees_map.get(task_id))
 
     def get_with_incident_pdn(self, task_id: int) -> tuple[Task, int] | None:
-        """Fetch a task together with its parent incident's has_personal_data flag."""
+        """Fetch a task together with its assignees and parent incident's has_personal_data flag."""
         with self.db.connection() as conn:
             row = conn.execute(
                 """
@@ -1212,7 +1306,8 @@ class TaskRepository(_BaseRepository):
             ).fetchone()
             if row is None:
                 return None
-            return _row_to_task(row), int(row["has_personal_data"])
+            assignees_map = self._load_assignees_map(conn, [task_id])
+            return _row_to_task(row, assignees_map.get(task_id)), int(row["has_personal_data"])
 
     def list_by_incident(self, incident_id: int) -> list[Task]:
         """List tasks attached to an incident ordered by creation."""
@@ -1221,7 +1316,8 @@ class TaskRepository(_BaseRepository):
                 "SELECT * FROM tasks WHERE incident_id = ? ORDER BY id ASC",
                 (incident_id,),
             ).fetchall()
-            return [_row_to_task(r) for r in rows]
+            assignees_map = self._load_assignees_map(conn, [r["id"] for r in rows])
+            return [_row_to_task(r, assignees_map.get(r["id"])) for r in rows]
 
     def _query_filtered_rows(
         self,
@@ -1229,15 +1325,23 @@ class TaskRepository(_BaseRepository):
         status: str | None = None,
         incident_id: int | None = None,
         exclude_personal_data: bool = False,
-    ) -> list[sqlite3.Row]:
+    ) -> tuple[list[sqlite3.Row], dict[int, list[int]]]:
         clauses: list[str] = []
         params: list[Any] = []
 
         if exclude_personal_data:
             clauses.append("i.has_personal_data = 0")
         if assigned_to is not None:
-            clauses.append("t.assigned_to = ?")
-            params.append(assigned_to)
+            clauses.append(
+                """(
+                    t.assigned_to = ?
+                    OR EXISTS (
+                        SELECT 1 FROM task_assignees ta
+                        WHERE ta.task_id = t.id AND ta.user_id = ?
+                    )
+                )"""
+            )
+            params.extend([assigned_to, assigned_to])
         if status:
             resolved_status = TaskStatus.resolve(status)
             clauses.append("t.status = ?")
@@ -1255,7 +1359,9 @@ class TaskRepository(_BaseRepository):
             ORDER BY t.id DESC
         """
         with self.db.connection() as conn:
-            return conn.execute(sql, params).fetchall()
+            rows = conn.execute(sql, params).fetchall()
+            assignees_map = self._load_assignees_map(conn, [r["id"] for r in rows])
+            return rows, assignees_map
 
     def list_filtered(
         self,
@@ -1265,13 +1371,13 @@ class TaskRepository(_BaseRepository):
         exclude_personal_data: bool = False,
     ) -> list[Task]:
         """List filtered tasks as domain Task objects."""
-        rows = self._query_filtered_rows(
+        rows, assignees_map = self._query_filtered_rows(
             assigned_to=assigned_to,
             status=status,
             incident_id=incident_id,
             exclude_personal_data=exclude_personal_data,
         )
-        return [_row_to_task(r) for r in rows]
+        return [_row_to_task(r, assignees_map.get(r["id"])) for r in rows]
 
     def list_filtered_with_meta(
         self,
@@ -1280,14 +1386,22 @@ class TaskRepository(_BaseRepository):
         incident_id: int | None = None,
         exclude_personal_data: bool = False,
     ) -> list[dict[str, Any]]:
-        """List filtered tasks enriched with incident_title and has_personal_data."""
-        rows = self._query_filtered_rows(
+        """List filtered tasks enriched with incident_title, has_personal_data, and assignee_ids."""
+        rows, assignees_map = self._query_filtered_rows(
             assigned_to=assigned_to,
             status=status,
             incident_id=incident_id,
             exclude_personal_data=exclude_personal_data,
         )
-        return [dict(r) for r in rows]
+        result: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            item_ids = assignees_map.get(r["id"])
+            if item_ids is None:
+                item_ids = [int(item["assigned_to"])] if item.get("assigned_to") is not None else []
+            item["assignee_ids"] = item_ids
+            result.append(item)
+        return result
 
     def create(
         self,
@@ -1299,9 +1413,12 @@ class TaskRepository(_BaseRepository):
         created_at: str | None = None,
         due_date: str | None = None,
         status: str = TaskStatus.OPEN.value,
+        assignee_ids: Iterable[int] | None = None,
     ) -> Task:
-        """Create a new task and return the persisted Task model."""
+        """Create a new task with up to MAX_TASK_ASSIGNEES assignees and return the Task model."""
         ts = created_at or utc_now()
+        effective_ids = self._resolve_assignee_ids(assigned_to, assignee_ids)
+        primary_assigned_to = effective_ids[0] if effective_ids else None
         with self.db.connection() as conn:
             cur = conn.execute(
                 """
@@ -1310,14 +1427,30 @@ class TaskRepository(_BaseRepository):
                     status, result, created_by, created_at, due_date
                 ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)
                 """,
-                (incident_id, title, description, assigned_to, status, created_by, ts, due_date),
+                (
+                    incident_id,
+                    title,
+                    description,
+                    primary_assigned_to,
+                    status,
+                    created_by,
+                    ts,
+                    due_date,
+                ),
             )
+            task_id = int(cur.lastrowid)
+            self._sync_assignees(conn, task_id, effective_ids, ts)
             conn.commit()
-            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (cur.lastrowid,)).fetchone()
-            return _row_to_task(row)
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            return _row_to_task(row, effective_ids)
 
     def update(self, task: Task) -> Task:
-        """Persist task updates and return the reloaded Task model."""
+        """Persist task updates including task_assignees and return the reloaded Task model."""
+        effective_ids = self._resolve_assignee_ids(task.assigned_to, task.assignee_ids)
+        primary_assigned_to = effective_ids[0] if effective_ids else None
+        task.assignee_ids = effective_ids
+        task.assigned_to = primary_assigned_to
+        now = utc_now()
         with self.db.connection() as conn:
             conn.execute(
                 """
@@ -1329,7 +1462,7 @@ class TaskRepository(_BaseRepository):
                 (
                     task.title,
                     task.description,
-                    task.assigned_to,
+                    primary_assigned_to,
                     task.status,
                     task.result,
                     task.completed_at,
@@ -1337,9 +1470,10 @@ class TaskRepository(_BaseRepository):
                     task.id,
                 ),
             )
+            self._sync_assignees(conn, task.id, effective_ids, now)
             conn.commit()
             row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task.id,)).fetchone()
-            return _row_to_task(row)
+            return _row_to_task(row, effective_ids)
 
 
 class NotificationRepository(_BaseRepository):

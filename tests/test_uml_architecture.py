@@ -176,6 +176,27 @@ class TestDomainModels(unittest.TestCase):
         self.assertEqual(overdue_task.completed_at, "2026-11-20T12:05:00+00:00")
         self.assertFalse(overdue_task.is_overdue(now))
         self.assertEqual(overdue_task.to_dict()["result"], "Угроза удалена")
+        self.assertEqual(overdue_task.assignee_ids, [2])
+
+        # Multi-assignee domain helpers (max 3, deduplication, primary sync)
+        self.assertTrue(overdue_task.add_assignee(3))
+        self.assertFalse(overdue_task.add_assignee(3))  # idempotent
+        self.assertTrue(overdue_task.add_assignee(4))
+        self.assertEqual(overdue_task.assignee_ids, [2, 3, 4])
+        self.assertEqual(overdue_task.assigned_to, 2)
+        with self.assertRaises(ValueError):
+            overdue_task.add_assignee(5)
+
+        self.assertTrue(overdue_task.remove_assignee(2))
+        self.assertEqual(overdue_task.assignee_ids, [3, 4])
+        self.assertEqual(overdue_task.assigned_to, 3)
+        self.assertFalse(overdue_task.remove_assignee(999))
+
+        overdue_task.set_assignees([5, 5, 6])
+        self.assertEqual(overdue_task.assignee_ids, [5, 6])
+        self.assertEqual(overdue_task.assigned_to, 5)
+        with self.assertRaises(ValueError):
+            overdue_task.set_assignees([1, 2, 3, 4])
 
     def test_regulator_notice_build_draft_and_mark_sent(self) -> None:
         inc = Incident(
@@ -602,6 +623,12 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
                 }
                 self.assertIn("audit_log", tables)
                 self.assertIn("ingestion_errors", tables)
+                self.assertIn("task_assignees", tables)
+
+                backfilled = migrated.execute(
+                    "SELECT task_id, user_id, position FROM task_assignees WHERE task_id = 1"
+                ).fetchall()
+                self.assertEqual([(r["task_id"], r["user_id"], r["position"]) for r in backfilled], [(1, 1, 0)])
 
                 def cols(table: str) -> set[str]:
                     return {r["name"] for r in migrated.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -628,6 +655,7 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
             tasks = container.task_repo.list_by_incident(1)
             self.assertEqual(len(tasks), 1)
             self.assertIsNone(tasks[0].due_date)
+            self.assertEqual(tasks[0].assignee_ids, [1])
 
             notifs = container.notification_repo.list_all()
             self.assertEqual(len(notifs), 1)

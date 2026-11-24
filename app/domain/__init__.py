@@ -1,4 +1,5 @@
 from app.domain.models import (
+    MAX_TASK_ASSIGNEES,
     Attachment,
     AuditRecord,
     Computer,
@@ -21,6 +22,7 @@ from app.domain.models import (
 )
 
 __all__ = [
+    "MAX_TASK_ASSIGNEES",
     "Attachment",
     "AuditRecord",
     "Computer",
