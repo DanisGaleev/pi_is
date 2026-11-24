@@ -2,6 +2,7 @@ from app.repositories.sqlite_repo import (
     DEFAULT_INCIDENT_SORT_BY,
     DEFAULT_INCIDENT_SORT_ORDER,
     SCHEMA_SQL,
+    AttachmentRepository,
     AuditRepository,
     Database,
     HistoryRepository,
@@ -21,6 +22,7 @@ from app.repositories.sqlite_repo import (
 )
 
 __all__ = [
+    "AttachmentRepository",
     "AuditRepository",
     "DEFAULT_INCIDENT_SORT_BY",
     "DEFAULT_INCIDENT_SORT_ORDER",
