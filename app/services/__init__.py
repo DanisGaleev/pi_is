@@ -1,4 +1,5 @@
 from app.services.access import AccessControlService
+from app.services.attachments import AttachmentService
 from app.services.dispatch import DispatchRule, IncidentDispatcher
 from app.services.exceptions import (
     AccessDeniedError,
@@ -26,6 +27,7 @@ from app.services.users import UserService
 __all__ = [
     "AccessControlService",
     "AccessDeniedError",
+    "AttachmentService",
     "DeadlineService",
     "DeduplicationService",
     "DispatchRule",

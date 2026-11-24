@@ -313,7 +313,7 @@ class FollowUpMeasure:
 
 @dataclass
 class Attachment:
-    """Evidence or document file attached to an incident."""
+    """Evidence or document file attached to an incident and optionally a task."""
 
     id: int
     incident_id: int
@@ -322,15 +322,19 @@ class Attachment:
     path: str
     uploaded_by: int | None
     uploaded_at: str
+    task_id: int | None = None
+    size_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize attachment metadata to a plain dictionary."""
         return {
             "id": self.id,
             "incident_id": self.incident_id,
+            "task_id": self.task_id,
             "filename": self.filename,
             "mime_type": self.mime_type,
             "path": self.path,
+            "size_bytes": self.size_bytes,
             "uploaded_by": self.uploaded_by,
             "uploaded_at": self.uploaded_at,
         }
