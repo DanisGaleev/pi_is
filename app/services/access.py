@@ -73,6 +73,13 @@ _RKN_ACCESS_ROLES: frozenset[Role] = frozenset(
     }
 )
 
+_TELEGRAM_MANAGE_ROLES: frozenset[Role] = frozenset(
+    {
+        Role.SECURITY_SPECIALIST,
+        Role.IT_HEAD,
+    }
+)
+
 
 def _incident_category(incident: Incident | Mapping[str, Any]) -> AccessCategory:
     if isinstance(incident, Incident):
@@ -192,6 +199,23 @@ class AccessControlService:
         """Return True if the user can view or edit Roskomnadzor notices."""
         actor = coerce_user(user)
         return actor.active and actor.role in _RKN_ACCESS_ROLES
+
+    def can_manage_telegram(self, user: User | Mapping[str, Any]) -> bool:
+        """Return True if the user can configure Telegram bot and manage subscriptions."""
+        actor = coerce_user(user)
+        return actor.active and actor.role in _TELEGRAM_MANAGE_ROLES
+
+    def assert_telegram_manage_access(
+        self,
+        user: User | Mapping[str, Any],
+        *,
+        action: str = "access_denied",
+    ) -> None:
+        """Verify permission to manage Telegram notifications or log denial."""
+        actor = coerce_user(user)
+        if not self.can_manage_telegram(actor):
+            self.log_access(actor.id, "telegram_config", None, action)
+            raise AccessDeniedError("Управление Telegram-уведомлениями запрещено")
 
     def assert_incident_access(
         self,

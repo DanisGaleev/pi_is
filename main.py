@@ -6,7 +6,7 @@ from fastapi.responses import JSONResponse
 import auth
 from app.container import container
 from app.services.exceptions import ServiceError
-from routers import incidents, ops
+from routers import incidents, ops, telegram
 
 
 @asynccontextmanager
@@ -26,3 +26,4 @@ async def service_error_handler(_request: Request, exc: ServiceError) -> JSONRes
 app.include_router(auth.router)
 app.include_router(incidents.router)
 app.include_router(ops.router)
+app.include_router(telegram.router)

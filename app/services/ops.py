@@ -1,6 +1,6 @@
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.domain.models import Deadlines, Incident, RegulatorNotice, ReportFile, User
 from app.enums import (
@@ -38,6 +38,9 @@ from app.services.validators import (
     require_non_blank,
     require_positive_int,
 )
+
+if TYPE_CHECKING:
+    from app.services.telegram import TelegramNotificationService
 
 
 def _parse_iso(ts: str) -> datetime:
@@ -490,7 +493,10 @@ class NotificationService:
             )
 
         if channel_enum is Channel.TELEGRAM and self.telegram_adapter is not None:
-            self.telegram_adapter.send_message(recipient_name or role_val, message)
+            ok = self.telegram_adapter.send_message(recipient_name or role_val, message)
+            if not ok:
+                self.notification_repo.update_status(notif.id, DeliveryStatus.FAILED)
+                notif.status = DeliveryStatus.FAILED.value
 
         return notif.to_dict()
 
@@ -573,12 +579,14 @@ class EscalationService:
         history_repo: HistoryRepository,
         notification_service: NotificationService,
         notification_repo: NotificationRepository,
+        telegram_service: "TelegramNotificationService | None" = None,
     ) -> None:
         self.incident_repo = incident_repo
         self.user_repo = user_repo
         self.history_repo = history_repo
         self.notification_service = notification_service
         self.notification_repo = notification_repo
+        self.telegram_service = telegram_service
         self._stopped_keys: set[tuple[str, int]] = set()
 
     def _is_stopped(self, incident: Incident) -> bool:
@@ -637,6 +645,13 @@ class EscalationService:
                     )
                     if notif is not None:
                         created.append(notif)
+                        if self.telegram_service is not None:
+                            self.telegram_service.notify_escalation(
+                                inc,
+                                Role.IT_HEAD,
+                                "escalation_30m",
+                                self._escalation_30m_message(inc),
+                            )
 
             if include_pdn_notices and PdnFlag.from_bool_int(inc.has_personal_data) is PdnFlag.YES:
                 lawyer_msg = (
@@ -652,6 +667,13 @@ class EscalationService:
                 )
                 if lawyer_notif is not None:
                     created.append(lawyer_notif)
+                    if self.telegram_service is not None:
+                        self.telegram_service.notify_escalation(
+                            inc,
+                            Role.LAWYER,
+                            "pdn_lawyer_notice",
+                            lawyer_msg,
+                        )
 
                 acc_msg = (
                     f"Уведомление (ПДн): инцидент #{inc.id} «{inc.title}» затрагивает ПДн — "
@@ -666,6 +688,13 @@ class EscalationService:
                 )
                 if acc_notif is not None:
                     created.append(acc_notif)
+                    if self.telegram_service is not None:
+                        self.telegram_service.notify_escalation(
+                            inc,
+                            Role.ACCOUNTANT,
+                            "pdn_accounting_notice",
+                            acc_msg,
+                        )
 
         return created
 
@@ -706,13 +735,16 @@ class EscalationService:
         )
         for role, kind, message in chain:
             if not self.notification_repo.exists(incident.id, kind):
-                return self.notification_service.notify_urgent(
+                notif = self.notification_service.notify_urgent(
                     incident_id=incident.id,
                     recipient_role=role,
                     recipient_name=users_by_role.get(role.value, role.label),
                     kind=kind,
                     message=message,
                 )
+                if notif is not None and self.telegram_service is not None:
+                    self.telegram_service.notify_escalation(incident, role, kind, message)
+                return notif
         return None
 
     def stop(self, incident: Incident) -> None:

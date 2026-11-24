@@ -18,6 +18,8 @@ from app.domain.models import (
     InstructionProgress,
     Notification,
     Task,
+    TelegramSettings,
+    TelegramSubscription,
     User,
 )
 from app.enums import (
@@ -200,6 +202,33 @@ CREATE TABLE IF NOT EXISTS ingestion_errors (
     error_text TEXT NOT NULL,
     occurred_at TEXT NOT NULL,
     resolved INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS telegram_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    bot_token TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    webhook_secret TEXT NOT NULL DEFAULT '',
+    app_base_url TEXT NOT NULL DEFAULT '',
+    notify_on_create INTEGER NOT NULL DEFAULT 1,
+    notify_on_status INTEGER NOT NULL DEFAULT 1,
+    notify_on_escalation INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS telegram_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT UNIQUE NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    min_severity TEXT NOT NULL DEFAULT '{Severity.LOW.value}',
+    notify_on_create INTEGER NOT NULL DEFAULT 1,
+    notify_on_status INTEGER NOT NULL DEFAULT 1,
+    notify_on_escalation INTEGER NOT NULL DEFAULT 1,
+    include_pdn INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 """
 
@@ -1484,6 +1513,16 @@ class NotificationRepository(_BaseRepository):
             rows = conn.execute(sql, params).fetchall()
             return [_row_to_notification(r) for r in rows]
 
+    def update_status(self, notification_id: int, status: DeliveryStatus | str) -> None:
+        """Update delivery status for an existing notification record."""
+        status_val = status.value if isinstance(status, DeliveryStatus) else str(status)
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE notifications SET status = ? WHERE id = ?",
+                (status_val, notification_id),
+            )
+            conn.commit()
+
 
 class AuditRepository(_BaseRepository):
     """Persistence operations for access-control audit records."""
@@ -1614,3 +1653,192 @@ class IngestionErrorRepository(_BaseRepository):
                 occurred_at=row["occurred_at"],
                 resolved=bool(row["resolved"]),
             )
+
+
+def _row_to_tg_settings(row: sqlite3.Row) -> TelegramSettings:
+    return TelegramSettings(
+        id=row["id"],
+        bot_token=row["bot_token"],
+        enabled=bool(row["enabled"]),
+        webhook_secret=row["webhook_secret"],
+        app_base_url=row["app_base_url"],
+        notify_on_create=bool(row["notify_on_create"]),
+        notify_on_status=bool(row["notify_on_status"]),
+        notify_on_escalation=bool(row["notify_on_escalation"]),
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_tg_subscription(row: sqlite3.Row) -> TelegramSubscription:
+    return TelegramSubscription(
+        id=row["id"],
+        chat_id=row["chat_id"],
+        label=row["label"],
+        role=row["role"],
+        min_severity=row["min_severity"],
+        notify_on_create=bool(row["notify_on_create"]),
+        notify_on_status=bool(row["notify_on_status"]),
+        notify_on_escalation=bool(row["notify_on_escalation"]),
+        include_pdn=bool(row["include_pdn"]),
+        active=bool(row["active"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+class TelegramRepository(_BaseRepository):
+    """Persistence operations for Telegram bot configuration and chat subscriptions."""
+
+    def get_settings(self) -> TelegramSettings:
+        """Fetch singleton Telegram configuration row or return defaults."""
+        with self.db.connection() as conn:
+            row = conn.execute("SELECT * FROM telegram_settings WHERE id = 1").fetchone()
+            if row is None:
+                return TelegramSettings()
+            return _row_to_tg_settings(row)
+
+    def save_settings(self, settings: TelegramSettings) -> TelegramSettings:
+        """Insert or update singleton Telegram configuration row."""
+        now = settings.updated_at or utc_now()
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_settings (
+                    id, bot_token, enabled, webhook_secret, app_base_url,
+                    notify_on_create, notify_on_status, notify_on_escalation, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    bot_token = excluded.bot_token,
+                    enabled = excluded.enabled,
+                    webhook_secret = excluded.webhook_secret,
+                    app_base_url = excluded.app_base_url,
+                    notify_on_create = excluded.notify_on_create,
+                    notify_on_status = excluded.notify_on_status,
+                    notify_on_escalation = excluded.notify_on_escalation,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    settings.bot_token,
+                    1 if settings.enabled else 0,
+                    settings.webhook_secret,
+                    settings.app_base_url,
+                    1 if settings.notify_on_create else 0,
+                    1 if settings.notify_on_status else 0,
+                    1 if settings.notify_on_escalation else 0,
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM telegram_settings WHERE id = 1").fetchone()
+            return _row_to_tg_settings(row)
+
+    def list_subscriptions(self, *, active_only: bool = False) -> list[TelegramSubscription]:
+        """List Telegram chat subscriptions ordered by ID."""
+        sql = "SELECT * FROM telegram_subscriptions"
+        if active_only:
+            sql += " WHERE active = 1"
+        sql += " ORDER BY id ASC"
+        with self.db.connection() as conn:
+            rows = conn.execute(sql).fetchall()
+            return [_row_to_tg_subscription(r) for r in rows]
+
+    def get_subscription(self, sub_id: int) -> TelegramSubscription | None:
+        """Fetch a Telegram subscription by primary key ID."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM telegram_subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row) if row is not None else None
+
+    def get_subscription_by_chat_id(self, chat_id: str) -> TelegramSubscription | None:
+        """Fetch a Telegram subscription by chat_id."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM telegram_subscriptions WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row) if row is not None else None
+
+    def upsert_subscription(self, sub: TelegramSubscription) -> TelegramSubscription:
+        """Create or update a subscription keyed by chat_id."""
+        now = sub.updated_at or utc_now()
+        created_at = sub.created_at or now
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_subscriptions (
+                    chat_id, label, role, min_severity,
+                    notify_on_create, notify_on_status, notify_on_escalation,
+                    include_pdn, active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    label = excluded.label,
+                    role = excluded.role,
+                    min_severity = excluded.min_severity,
+                    notify_on_create = excluded.notify_on_create,
+                    notify_on_status = excluded.notify_on_status,
+                    notify_on_escalation = excluded.notify_on_escalation,
+                    include_pdn = excluded.include_pdn,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    sub.chat_id,
+                    sub.label,
+                    sub.role,
+                    sub.min_severity,
+                    1 if sub.notify_on_create else 0,
+                    1 if sub.notify_on_status else 0,
+                    1 if sub.notify_on_escalation else 0,
+                    1 if sub.include_pdn else 0,
+                    1 if sub.active else 0,
+                    created_at,
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM telegram_subscriptions WHERE chat_id = ?",
+                (sub.chat_id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row)
+
+    def update_subscription(self, sub: TelegramSubscription) -> TelegramSubscription:
+        """Persist changes to an existing Telegram subscription."""
+        now = sub.updated_at or utc_now()
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_subscriptions
+                SET label = ?, role = ?, min_severity = ?,
+                    notify_on_create = ?, notify_on_status = ?, notify_on_escalation = ?,
+                    include_pdn = ?, active = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    sub.label,
+                    sub.role,
+                    sub.min_severity,
+                    1 if sub.notify_on_create else 0,
+                    1 if sub.notify_on_status else 0,
+                    1 if sub.notify_on_escalation else 0,
+                    1 if sub.include_pdn else 0,
+                    1 if sub.active else 0,
+                    now,
+                    sub.id,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM telegram_subscriptions WHERE id = ?",
+                (sub.id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row)
+
+    def delete_subscription(self, sub_id: int) -> bool:
+        """Delete a Telegram subscription by ID."""
+        with self.db.connection() as conn:
+            cur = conn.execute("DELETE FROM telegram_subscriptions WHERE id = ?", (sub_id,))
+            conn.commit()
+            return cur.rowcount > 0
