@@ -21,7 +21,6 @@ from app.domain.models import (
     User,
 )
 from app.enums import (
-    SEVERITY_WEIGHTS,
     AccessCategory,
     Channel,
     CheckResult,
@@ -32,6 +31,14 @@ from app.enums import (
     Severity,
     SourceType,
     TaskStatus,
+)
+from app.repositories.schema import (
+    LOOKUP_TABLES_SQL,
+    SCHEMA_SQL,
+    apply_migrations,
+    get_or_create_code_id,
+    seed_dispatch_rules,
+    seed_lookups,
 )
 
 
@@ -82,229 +89,190 @@ def hash_password(password: str) -> str:
 _sha256 = hash_password
 
 
-SCHEMA_SQL = f"""
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    full_name TEXT NOT NULL,
-    role TEXT NOT NULL,
-    active INTEGER NOT NULL DEFAULT 1
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    token TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS instructions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    incident_type TEXT NOT NULL,
-    steps_json TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS incidents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    incident_type TEXT NOT NULL,
-    severity TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT '{IncidentStatus.NEW.value}',
-    outcome TEXT NOT NULL DEFAULT '',
-    computer TEXT NOT NULL DEFAULT '',
-    employee TEXT NOT NULL DEFAULT '',
-    source TEXT NOT NULL DEFAULT '',
-    incident_key TEXT NOT NULL DEFAULT '',
-    has_personal_data INTEGER NOT NULL DEFAULT 0,
-    instruction_id INTEGER REFERENCES instructions(id),
-    rkn_draft TEXT NOT NULL DEFAULT '',
-    detected_at TEXT NOT NULL,
-    taken_at TEXT,
-    closed_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    access_category TEXT NOT NULL DEFAULT '',
-    assigned_to INTEGER REFERENCES users(id),
-    rkn_sent_at TEXT,
-    rkn_confirmation TEXT NOT NULL DEFAULT ''
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
-    source TEXT NOT NULL DEFAULT '',
-    sender TEXT NOT NULL DEFAULT '',
-    body TEXT NOT NULL,
-    incident_key TEXT NOT NULL DEFAULT '',
-    received_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
-    user_id INTEGER REFERENCES users(id),
-    action TEXT NOT NULL,
-    details TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS step_progress (
-    incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
-    step_index INTEGER NOT NULL,
-    completed INTEGER NOT NULL DEFAULT 0,
-    updated_by INTEGER REFERENCES users(id),
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (incident_id, step_index)
-);
-
-CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL DEFAULT '',
-    assigned_to INTEGER REFERENCES users(id),
-    status TEXT NOT NULL DEFAULT '{TaskStatus.OPEN.value}',
-    result TEXT NOT NULL DEFAULT '',
-    created_by INTEGER REFERENCES users(id),
-    created_at TEXT NOT NULL,
-    completed_at TEXT,
-    due_date TEXT
-);
-
-CREATE TABLE IF NOT EXISTS notifications (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    incident_id INTEGER REFERENCES incidents(id) ON DELETE CASCADE,
-    recipient_role TEXT NOT NULL,
-    recipient_name TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    message TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    channel TEXT NOT NULL DEFAULT '{Channel.INTERNAL.value}',
-    status TEXT NOT NULL DEFAULT '{DeliveryStatus.SENT.value}'
-);
-
-CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER REFERENCES users(id),
-    object_type TEXT NOT NULL,
-    object_id INTEGER,
-    action TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS ingestion_errors (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source TEXT NOT NULL DEFAULT '',
-    error_text TEXT NOT NULL,
-    occurred_at TEXT NOT NULL,
-    resolved INTEGER NOT NULL DEFAULT 0
-);
-"""
-
-_COLUMN_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
-    "users": (
-        ("active", "INTEGER NOT NULL DEFAULT 1"),
-    ),
-    "tasks": (
-        ("due_date", "TEXT"),
-    ),
-    "incidents": (
-        ("access_category", "TEXT NOT NULL DEFAULT ''"),
-        ("assigned_to", "INTEGER REFERENCES users(id)"),
-        ("rkn_sent_at", "TEXT"),
-        ("rkn_confirmation", "TEXT NOT NULL DEFAULT ''"),
-    ),
-    "notifications": (
-        ("channel", f"TEXT NOT NULL DEFAULT '{Channel.INTERNAL.value}'"),
-        ("status", f"TEXT NOT NULL DEFAULT '{DeliveryStatus.SENT.value}'"),
-    ),
-}
+def _lookup_id(conn: sqlite3.Connection, table: str, column: str, value: str) -> int:
+    row = conn.execute(
+        f"SELECT id FROM {table} WHERE {column} = ?",
+        (value,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Lookup value {value!r} not found in {table}.{column}")
+    return int(row["id"])
 
 
-def _apply_migrations(conn: sqlite3.Connection) -> None:
-    """Safely add missing UML columns to pre-existing SQLite tables."""
-    for table, columns in _COLUMN_MIGRATIONS.items():
-        existing = {
-            row["name"]
-            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-        }
-        for col_name, col_def in columns:
-            if col_name not in existing:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+def _resolve_role_id(conn: sqlite3.Connection, role: Role | str) -> int:
+    role_val = role.value if isinstance(role, Role) else str(role).strip()
+    return _lookup_id(conn, "roles", "code", role_val)
+
+
+def _resolve_incident_type_id(conn: sqlite3.Connection, incident_type: IncidentType | str) -> int:
+    norm = IncidentType.normalize(incident_type)
+    return _lookup_id(conn, "incident_types", "name", norm.value)
+
+
+def _resolve_severity_id(conn: sqlite3.Connection, severity: Severity | str | None) -> int | None:
+    if severity is None or not str(severity).strip():
+        return None
+    try:
+        norm = Severity.normalize(str(severity))
+    except ValueError:
+        return None
+    return _lookup_id(conn, "severities", "code", norm.value)
+
+
+def _resolve_incident_status_id(conn: sqlite3.Connection, status: IncidentStatus | str) -> int:
+    norm = IncidentStatus.normalize(status)
+    return _lookup_id(conn, "incident_statuses", "name", norm.value)
+
+
+def _resolve_access_category_id(conn: sqlite3.Connection, category: AccessCategory | str) -> int:
+    cat = category if isinstance(category, AccessCategory) else AccessCategory(str(category).strip())
+    return _lookup_id(conn, "access_categories", "name", cat.value)
+
+
+def _resolve_source_id(conn: sqlite3.Connection, source: SourceType | str | None) -> int | None:
+    if isinstance(source, SourceType):
+        return _lookup_id(conn, "sources", "name", source.value)
+    cleaned = str(source or "").strip()
+    if not cleaned:
+        return None
+    norm = SourceType.normalize(cleaned)
+    return _lookup_id(conn, "sources", "name", norm.value)
+
+
+def _resolve_outcome(conn: sqlite3.Connection, outcome: CheckResult | str | None) -> tuple[int | None, str]:
+    if isinstance(outcome, CheckResult):
+        return _lookup_id(conn, "check_results", "name", outcome.value), ""
+    cleaned = str(outcome or "").strip()
+    if not cleaned:
+        return None, ""
+    try:
+        norm = CheckResult.normalize(cleaned)
+        return _lookup_id(conn, "check_results", "name", norm.value), ""
+    except ValueError:
+        return None, cleaned
+
+
+def _resolve_task_status_id(conn: sqlite3.Connection, status: TaskStatus | str) -> int:
+    norm = TaskStatus.normalize(status)
+    return _lookup_id(conn, "task_statuses", "name", norm.value)
+
+
+def _resolve_channel_id(conn: sqlite3.Connection, channel: Channel | str) -> int:
+    ch = channel if isinstance(channel, Channel) else Channel(str(channel).strip().lower())
+    return _lookup_id(conn, "notification_channels", "name", ch.value)
+
+
+def _resolve_delivery_status_id(conn: sqlite3.Connection, status: DeliveryStatus | str) -> int:
+    ds = status if isinstance(status, DeliveryStatus) else DeliveryStatus(str(status).strip().lower())
+    return _lookup_id(conn, "delivery_statuses", "name", ds.value)
+
+
+def _get_or_create_computer_id(conn: sqlite3.Connection, hostname: str | None) -> int | None:
+    cleaned = str(hostname or "").strip()
+    if not cleaned:
+        return None
+    conn.execute("INSERT OR IGNORE INTO computers (hostname) VALUES (?)", (cleaned,))
+    return _lookup_id(conn, "computers", "hostname", cleaned)
+
+
+def _get_or_create_employee_id(conn: sqlite3.Connection, full_name: str | None) -> int | None:
+    cleaned = str(full_name or "").strip()
+    if not cleaned:
+        return None
+    conn.execute("INSERT OR IGNORE INTO employees (full_name) VALUES (?)", (cleaned,))
+    return _lookup_id(conn, "employees", "full_name", cleaned)
+
+
+def _sync_regulator_notice(
+    conn: sqlite3.Connection,
+    incident_id: int,
+    draft: str,
+    sent_at: str | None,
+    confirmation: str,
+) -> None:
+    if draft or sent_at is not None or confirmation:
+        conn.execute(
+            """
+            INSERT INTO regulator_notices (incident_id, draft, sent_at, confirmation)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(incident_id) DO UPDATE SET
+                draft = excluded.draft,
+                sent_at = excluded.sent_at,
+                confirmation = excluded.confirmation
+            """,
+            (incident_id, draft, sent_at, confirmation),
+        )
+    else:
+        conn.execute(
+            "DELETE FROM regulator_notices WHERE incident_id = ?",
+            (incident_id,),
+        )
 
 
 def _seed(conn: sqlite3.Connection) -> None:
     """Populate initial demo users, instructions, incidents, messages, and history."""
     pw_hash = hash_password("password123")
     users = [
-        ("ib", pw_hash, "Иванов Алексей (ИБ)", Role.SECURITY_SPECIALIST.value),
-        ("sysadmin", pw_hash, "Петров Дмитрий (Сисадмин)", Role.SYS_ADMIN.value),
-        ("it_head", pw_hash, "Сидорова Елена (Руководитель ИТ)", Role.IT_HEAD.value),
-        ("lawyer", pw_hash, "Козлова Анна (Юрист)", Role.LAWYER.value),
+        ("ib", pw_hash, "Иванов Алексей (ИБ)", _resolve_role_id(conn, Role.SECURITY_SPECIALIST)),
+        ("sysadmin", pw_hash, "Петров Дмитрий (Сисадмин)", _resolve_role_id(conn, Role.SYS_ADMIN)),
+        ("it_head", pw_hash, "Сидорова Елена (Руководитель ИТ)", _resolve_role_id(conn, Role.IT_HEAD)),
+        ("lawyer", pw_hash, "Козлова Анна (Юрист)", _resolve_role_id(conn, Role.LAWYER)),
     ]
     conn.executemany(
-        "INSERT INTO users (username, password_hash, full_name, role) VALUES (?, ?, ?, ?)",
+        "INSERT INTO users (username, password_hash, full_name, role_id) VALUES (?, ?, ?, ?)",
         users,
     )
 
     instructions = [
         (
             "Реагирование на вредоносное ПО",
-            IncidentType.VIRUS.value,
-            json.dumps(
-                [
-                    "Изолировать рабочую станцию от сети",
-                    "Запустить полную антивирусную проверку",
-                    "Проверить журналы авторизации и сетевую активность",
-                    "Сменить скомпрометированные учетные данные",
-                ],
-                ensure_ascii=False,
-            ),
+            IncidentType.VIRUS,
+            [
+                "Изолировать рабочую станцию от сети",
+                "Запустить полную антивирусную проверку",
+                "Проверить журналы авторизации и сетевую активность",
+                "Сменить скомпрометированные учетные данные",
+            ],
         ),
         (
             "Реагирование на утечку ПДн",
-            IncidentType.DATA_LEAK.value,
-            json.dumps(
-                [
-                    "Зафиксировать объем и категории персональных данных",
-                    "Ограничить доступ к источнику утечки",
-                    "Подготовить первичное уведомление в РКН (24 часа)",
-                    "Уведомить юриста и руководство",
-                ],
-                ensure_ascii=False,
-            ),
+            IncidentType.DATA_LEAK,
+            [
+                "Зафиксировать объем и категории персональных данных",
+                "Ограничить доступ к источнику утечки",
+                "Подготовить первичное уведомление в РКН (24 часа)",
+                "Уведомить юриста и руководство",
+            ],
         ),
         (
             "Реагирование на фишинг",
-            IncidentType.PHISHING.value,
-            json.dumps(
-                [
-                    "Заблокировать домен/отправителя в почтовом шлюзе",
-                    "Проверить переходы сотрудников по ссылке",
-                    "Принудительно сбросить пароли затронутых учетных записей",
-                ],
-                ensure_ascii=False,
-            ),
+            IncidentType.PHISHING,
+            [
+                "Заблокировать домен/отправителя в почтовом шлюзе",
+                "Проверить переходы сотрудников по ссылке",
+                "Принудительно сбросить пароли затронутых учетных записей",
+            ],
         ),
         (
             "Несанкционированный доступ",
-            IncidentType.UNAUTHORIZED_ACCESS.value,
-            json.dumps(
-                [
-                    "Заблокировать подозрительную учетную запись/сессию",
-                    "Собрать логи доступа и IP-адреса источника",
-                    "Проверить целостность критичных систем",
-                ],
-                ensure_ascii=False,
-            ),
+            IncidentType.UNAUTHORIZED_ACCESS,
+            [
+                "Заблокировать подозрительную учетную запись/сессию",
+                "Собрать логи доступа и IP-адреса источника",
+                "Проверить целостность критичных систем",
+            ],
         ),
     ]
-    conn.executemany(
-        "INSERT INTO instructions (title, incident_type, steps_json) VALUES (?, ?, ?)",
-        instructions,
-    )
+    for title, inc_type, steps in instructions:
+        cur = conn.execute(
+            "INSERT INTO instructions (title, incident_type_id, version) VALUES (?, ?, 1)",
+            (title, _resolve_incident_type_id(conn, inc_type)),
+        )
+        inst_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO instruction_steps (instruction_id, step_index, step_text) VALUES (?, ?, ?)",
+            [(inst_id, idx, step_text) for idx, step_text in enumerate(steps)],
+        )
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
     t_45m_ago = (now - timedelta(minutes=45)).isoformat()
@@ -312,98 +280,137 @@ def _seed(conn: sqlite3.Connection) -> None:
     t_1d_ago = (now - timedelta(days=1)).isoformat()
     now_iso = now.isoformat()
 
-    incidents = [
+    seed_incidents = [
         (
             "Обнаружен троян на WS-FIN-04",
             "Антивирус зафиксировал попытку запуска Trojan.GenericKD на рабочей станции.",
-            IncidentType.VIRUS.value,
-            Severity.HIGH.value,
-            IncidentStatus.NEW.value,
+            IncidentType.VIRUS,
+            Severity.HIGH,
+            IncidentStatus.NEW,
             "",
             "WS-FIN-04",
             "Смирнова О.В.",
-            SourceType.KASPERSKY.value,
+            SourceType.KASPERSKY,
             "av-ws-fin-04-trojan",
             0,
             1,
-            "",
             t_45m_ago,
             None,
             None,
             t_45m_ago,
             t_45m_ago,
-            AccessCategory.EMPLOYEE_INVOLVED.value,
+            AccessCategory.EMPLOYEE_INVOLVED,
         ),
         (
             "Подозрение на выгрузку базы клиентов",
             "DLP-система зафиксировала выгрузку архива с ПДн клиентов на внешний ресурс.",
-            IncidentType.DATA_LEAK.value,
-            Severity.CRITICAL.value,
-            IncidentStatus.IN_PROGRESS.value,
+            IncidentType.DATA_LEAK,
+            Severity.CRITICAL,
+            IncidentStatus.IN_PROGRESS,
             "",
             "SRV-CRM-01",
             "Волков И.П.",
-            SourceType.DLP.value,
+            SourceType.DLP,
             "dlp-crm-export-01",
             1,
             2,
-            "",
             t_2h_ago,
             t_2h_ago,
             None,
             t_2h_ago,
             t_2h_ago,
-            AccessCategory.PERSONAL_DATA.value,
+            AccessCategory.PERSONAL_DATA,
         ),
         (
             "Фишинговая рассылка на бухгалтерию",
             "Получено письмо с поддельным счетом и вредоносной ссылкой.",
-            IncidentType.PHISHING.value,
-            Severity.MEDIUM.value,
-            IncidentStatus.CLOSED.value,
-            CheckResult.FALSE_POSITIVE.value,
+            IncidentType.PHISHING,
+            Severity.MEDIUM,
+            IncidentStatus.CLOSED,
+            CheckResult.FALSE_POSITIVE,
             "WS-ACC-02",
             "Морозова Т.А.",
-            SourceType.EMAIL.value,
+            SourceType.EMAIL,
             "mail-phish-acc-02",
             0,
             3,
-            "",
             t_1d_ago,
             t_1d_ago,
             now_iso,
             t_1d_ago,
             now_iso,
-            AccessCategory.EMPLOYEE_INVOLVED.value,
+            AccessCategory.EMPLOYEE_INVOLVED,
         ),
     ]
-    conn.executemany(
-        """
-        INSERT INTO incidents (
-            title, description, incident_type, severity, status, outcome,
-            computer, employee, source, incident_key, has_personal_data,
-            instruction_id, rkn_draft, detected_at, taken_at, closed_at,
-            created_at, updated_at, access_category
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        incidents,
-    )
+    for item in seed_incidents:
+        (
+            title,
+            description,
+            inc_type,
+            sev,
+            status,
+            outcome,
+            computer,
+            employee,
+            source,
+            inc_key,
+            has_pdn,
+            instruction_id,
+            detected_at,
+            taken_at,
+            closed_at,
+            created_at,
+            updated_at,
+            access_category,
+        ) = item
+        cr_id, outcome_note = _resolve_outcome(conn, outcome)
+        conn.execute(
+            """
+            INSERT INTO incidents (
+                title, description, incident_type_id, severity_id, status_id,
+                check_result_id, outcome_note, computer_id, employee_id, source_id,
+                incident_key, has_personal_data, instruction_id, detected_at,
+                taken_at, closed_at, created_at, updated_at, access_category_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                title,
+                description,
+                _resolve_incident_type_id(conn, inc_type),
+                _resolve_severity_id(conn, sev),
+                _resolve_incident_status_id(conn, status),
+                cr_id,
+                outcome_note,
+                _get_or_create_computer_id(conn, computer),
+                _get_or_create_employee_id(conn, employee),
+                _resolve_source_id(conn, source),
+                inc_key,
+                has_pdn,
+                instruction_id,
+                detected_at,
+                taken_at,
+                closed_at,
+                created_at,
+                updated_at,
+                _resolve_access_category_id(conn, access_category),
+            ),
+        )
 
     conn.execute(
-        "INSERT INTO messages (incident_id, source, sender, body, incident_key, received_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (1, SourceType.KASPERSKY.value, "AV-Agent", "Обнаружен Trojan.GenericKD на WS-FIN-04", "av-ws-fin-04-trojan", t_45m_ago),
+        "INSERT INTO messages (incident_id, source_id, sender, body, incident_key, received_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (1, _resolve_source_id(conn, SourceType.KASPERSKY), "AV-Agent", "Обнаружен Trojan.GenericKD на WS-FIN-04", "av-ws-fin-04-trojan", t_45m_ago),
     )
     conn.execute(
-        "INSERT INTO messages (incident_id, source, sender, body, incident_key, received_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (2, SourceType.DLP.value, "DLP-Sensor", "Выгрузка файла clients_pdn.zip с SRV-CRM-01", "dlp-crm-export-01", t_2h_ago),
+        "INSERT INTO messages (incident_id, source_id, sender, body, incident_key, received_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (2, _resolve_source_id(conn, SourceType.DLP), "DLP-Sensor", "Выгрузка файла clients_pdn.zip с SRV-CRM-01", "dlp-crm-export-01", t_2h_ago),
     )
     conn.execute(
-        "INSERT INTO history (incident_id, user_id, action, details, created_at) VALUES (?, ?, ?, ?, ?)",
-        (1, None, "created", f"Инцидент создан по сигналу {SourceType.KASPERSKY.value}", t_45m_ago),
+        "INSERT INTO history (incident_id, user_id, action_id, details, created_at) VALUES (?, ?, ?, ?, ?)",
+        (1, None, get_or_create_code_id(conn, "history_actions", "created"), f"Инцидент создан по сигналу {SourceType.KASPERSKY.value}", t_45m_ago),
     )
     conn.execute(
-        "INSERT INTO history (incident_id, user_id, action, details, created_at) VALUES (?, ?, ?, ?, ?)",
-        (2, 1, "status_changed", f"Статус изменен на {IncidentStatus.IN_PROGRESS.value}", t_2h_ago),
+        "INSERT INTO history (incident_id, user_id, action_id, details, created_at) VALUES (?, ?, ?, ?, ?)",
+        (2, 1, get_or_create_code_id(conn, "history_actions", "status_changed"), f"Статус изменен на {IncidentStatus.IN_PROGRESS.value}", t_2h_ago),
     )
 
 
@@ -444,8 +451,12 @@ class Database:
     def init_schema(self) -> None:
         """Create missing tables, safely migrate existing schemas, and seed empty DBs."""
         with self.connection() as conn:
+            conn.executescript(LOOKUP_TABLES_SQL)
+            seed_lookups(conn)
+            conn.commit()
+            apply_migrations(conn)
             conn.executescript(SCHEMA_SQL)
-            _apply_migrations(conn)
+            seed_dispatch_rules(conn)
             if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
                 _seed(conn)
             conn.commit()
@@ -544,6 +555,13 @@ def _row_to_notification(row: sqlite3.Row) -> Notification:
     )
 
 
+_USER_SELECT_SQL = """
+    SELECT u.id, u.username, u.full_name, r.code AS role, u.active
+    FROM users u
+    JOIN roles r ON r.id = u.role_id
+"""
+
+
 class UserRepository(_BaseRepository):
     """Persistence operations for system users."""
 
@@ -551,7 +569,7 @@ class UserRepository(_BaseRepository):
         """Fetch a user by primary key."""
         with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT id, username, full_name, role, active FROM users WHERE id = ?",
+                f"{_USER_SELECT_SQL} WHERE u.id = ?",
                 (user_id,),
             ).fetchone()
             return _row_to_user(row) if row is not None else None
@@ -560,7 +578,7 @@ class UserRepository(_BaseRepository):
         """Fetch a user by login name."""
         with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT id, username, full_name, role, active FROM users WHERE username = ?",
+                f"{_USER_SELECT_SQL} WHERE u.username = ?",
                 (username,),
             ).fetchone()
             return _row_to_user(row) if row is not None else None
@@ -569,7 +587,12 @@ class UserRepository(_BaseRepository):
         """Fetch a user and their stored password hash for credential verification."""
         with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT id, username, password_hash, full_name, role, active FROM users WHERE username = ?",
+                """
+                SELECT u.id, u.username, u.password_hash, u.full_name, r.code AS role, u.active
+                FROM users u
+                JOIN roles r ON r.id = u.role_id
+                WHERE u.username = ?
+                """,
                 (username,),
             ).fetchone()
             if row is None:
@@ -581,7 +604,7 @@ class UserRepository(_BaseRepository):
         role_val = role.value if isinstance(role, Role) else str(role)
         with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT id, username, full_name, role, active FROM users WHERE role = ? AND active = 1 ORDER BY id LIMIT 1",
+                f"{_USER_SELECT_SQL} WHERE r.code = ? AND u.active = 1 ORDER BY u.id LIMIT 1",
                 (role_val,),
             ).fetchone()
             return _row_to_user(row) if row is not None else None
@@ -589,9 +612,7 @@ class UserRepository(_BaseRepository):
     def list_all(self) -> list[User]:
         """Return all users ordered by id."""
         with self.db.connection() as conn:
-            rows = conn.execute(
-                "SELECT id, username, full_name, role, active FROM users ORDER BY id"
-            ).fetchall()
+            rows = conn.execute(f"{_USER_SELECT_SQL} ORDER BY u.id").fetchall()
             return [_row_to_user(r) for r in rows]
 
     def list_filtered(
@@ -605,24 +626,24 @@ class UserRepository(_BaseRepository):
         params: list[Any] = []
 
         if active_only:
-            clauses.append("active = 1")
+            clauses.append("u.active = 1")
         if role is not None:
             role_val = role.value if isinstance(role, Role) else str(role).strip()
             if role_val:
-                clauses.append("role = ?")
+                clauses.append("r.code = ?")
                 params.append(role_val)
         if roles is not None:
             role_vals = [r.value if isinstance(r, Role) else str(r) for r in roles]
             if not role_vals:
                 return []
             placeholders = ", ".join("?" for _ in role_vals)
-            clauses.append(f"role IN ({placeholders})")
+            clauses.append(f"r.code IN ({placeholders})")
             params.extend(role_vals)
 
-        sql = "SELECT id, username, full_name, role, active FROM users"
+        sql = _USER_SELECT_SQL
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY id"
+        sql += " ORDER BY u.id"
 
         with self.db.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
@@ -636,7 +657,7 @@ class UserRepository(_BaseRepository):
         placeholders = ", ".join("?" for _ in unique_ids)
         with self.db.connection() as conn:
             rows = conn.execute(
-                f"SELECT id, username, full_name, role, active FROM users WHERE id IN ({placeholders})",
+                f"{_USER_SELECT_SQL} WHERE u.id IN ({placeholders})",
                 unique_ids,
             ).fetchall()
             return {row["id"]: _row_to_user(row) for row in rows}
@@ -644,7 +665,13 @@ class UserRepository(_BaseRepository):
     def get_names_by_role(self) -> dict[str, str]:
         """Return a mapping of role code to user full name."""
         with self.db.connection() as conn:
-            rows = conn.execute("SELECT role, full_name FROM users").fetchall()
+            rows = conn.execute(
+                """
+                SELECT r.code AS role, u.full_name
+                FROM users u
+                JOIN roles r ON r.id = u.role_id
+                """
+            ).fetchall()
             return {r["role"]: r["full_name"] for r in rows}
 
     def create(
@@ -656,15 +683,15 @@ class UserRepository(_BaseRepository):
         active: bool = True,
     ) -> User:
         """Insert a new user record and return the persisted domain model."""
-        role_val = role.value if isinstance(role, Role) else str(role)
         with self.db.connection() as conn:
+            role_id = _resolve_role_id(conn, role)
             cur = conn.execute(
-                "INSERT INTO users (username, password_hash, full_name, role, active) VALUES (?, ?, ?, ?, ?)",
-                (username, password_hash, full_name, role_val, 1 if active else 0),
+                "INSERT INTO users (username, password_hash, full_name, role_id, active) VALUES (?, ?, ?, ?, ?)",
+                (username, password_hash, full_name, role_id, 1 if active else 0),
             )
             conn.commit()
             row = conn.execute(
-                "SELECT id, username, full_name, role, active FROM users WHERE id = ?",
+                f"{_USER_SELECT_SQL} WHERE u.id = ?",
                 (cur.lastrowid,),
             ).fetchone()
             return _row_to_user(row)
@@ -686,10 +713,11 @@ class SessionRepository(_BaseRepository):
         """Resolve an active user from a bearer session token."""
         with self.db.connection() as conn:
             row = conn.execute(
-                """
-                SELECT u.id, u.username, u.full_name, u.role, u.active
+                f"""
+                SELECT u.id, u.username, u.full_name, r.code AS role, u.active
                 FROM sessions s
                 JOIN users u ON u.id = s.user_id
+                JOIN roles r ON r.id = u.role_id
                 WHERE s.token = ? AND u.active = 1
                 """,
                 (token,),
@@ -706,23 +734,54 @@ class SessionRepository(_BaseRepository):
 DEFAULT_INCIDENT_SORT_BY = "severity"
 DEFAULT_INCIDENT_SORT_ORDER = "desc"
 
-_SEVERITY_WHEN_CLAUSES = " ".join(
-    f"WHEN '{sev.value}' THEN {weight}"
-    for sev, weight in sorted(SEVERITY_WEIGHTS.items(), key=lambda item: item[1], reverse=True)
-)
-_SEVERITY_PRIORITY_SQL = f"CASE LOWER(severity) {_SEVERITY_WHEN_CLAUSES} ELSE 0 END"
-
 _INCIDENT_SORT_EXPRESSIONS: dict[str, str] = {
-    "severity": _SEVERITY_PRIORITY_SQL,
-    "detected_at": "detected_at",
-    "created_at": "created_at",
-    "id": "id",
+    "severity": "COALESCE(sev.weight, 0)",
+    "detected_at": "i.detected_at",
+    "created_at": "i.created_at",
+    "id": "i.id",
 }
 
 _SORT_DIRECTIONS: dict[str, str] = {
     "desc": "DESC",
     "asc": "ASC",
 }
+
+_INCIDENT_SELECT_SQL = """
+    SELECT
+        i.id,
+        i.title,
+        i.description,
+        it.name AS incident_type,
+        COALESCE(sev.code, '') AS severity,
+        ist.name AS status,
+        COALESCE(cr.name, i.outcome_note, '') AS outcome,
+        COALESCE(comp.hostname, '') AS computer,
+        COALESCE(emp.full_name, '') AS employee,
+        COALESCE(src.name, '') AS source,
+        i.incident_key,
+        i.has_personal_data,
+        i.instruction_id,
+        COALESCE(rn.draft, '') AS rkn_draft,
+        i.detected_at,
+        i.taken_at,
+        i.closed_at,
+        i.created_at,
+        i.updated_at,
+        ac.name AS access_category,
+        i.assigned_to,
+        rn.sent_at AS rkn_sent_at,
+        COALESCE(rn.confirmation, '') AS rkn_confirmation
+    FROM incidents i
+    JOIN incident_types it ON it.id = i.incident_type_id
+    LEFT JOIN severities sev ON sev.id = i.severity_id
+    JOIN incident_statuses ist ON ist.id = i.status_id
+    LEFT JOIN check_results cr ON cr.id = i.check_result_id
+    LEFT JOIN computers comp ON comp.id = i.computer_id
+    LEFT JOIN employees emp ON emp.id = i.employee_id
+    LEFT JOIN sources src ON src.id = i.source_id
+    JOIN access_categories ac ON ac.id = i.access_category_id
+    LEFT JOIN regulator_notices rn ON rn.incident_id = i.id
+"""
 
 
 def resolve_incident_sort(
@@ -762,8 +821,8 @@ def _build_incident_order_by(
     expr = _INCIDENT_SORT_EXPRESSIONS[field_key]
     direction = _SORT_DIRECTIONS[order_key]
     if field_key == "id":
-        return f"id {direction}"
-    return f"{expr} {direction}, id {direction}"
+        return f"i.id {direction}"
+    return f"{expr} {direction}, i.id {direction}"
 
 
 class IncidentRepository(_BaseRepository):
@@ -772,7 +831,10 @@ class IncidentRepository(_BaseRepository):
     def get_by_id(self, incident_id: int) -> Incident | None:
         """Fetch an incident by ID."""
         with self.db.connection() as conn:
-            row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+            row = conn.execute(
+                f"{_INCIDENT_SELECT_SQL} WHERE i.id = ?",
+                (incident_id,),
+            ).fetchone()
             return _row_to_incident(row) if row is not None else None
 
     def list_filtered(
@@ -790,21 +852,23 @@ class IncidentRepository(_BaseRepository):
         params: list[Any] = []
 
         if exclude_personal_data:
-            clauses.append("has_personal_data = 0")
+            clauses.append("i.has_personal_data = 0")
         if q:
-            clauses.append("(cfold(computer) LIKE ? OR cfold(employee) LIKE ?)")
+            clauses.append(
+                "(cfold(COALESCE(comp.hostname, '')) LIKE ? OR cfold(COALESCE(emp.full_name, '')) LIKE ?)"
+            )
             like = f"%{q.casefold()}%"
             params.extend([like, like])
         if incident_type:
             resolved_type = IncidentType.resolve(incident_type)
-            clauses.append("incident_type = ?")
+            clauses.append("it.name = ?")
             params.append(resolved_type.value if resolved_type is not None else incident_type)
         if status:
             resolved_status = IncidentStatus.resolve(status)
-            clauses.append("status = ?")
+            clauses.append("ist.name = ?")
             params.append(resolved_status.value if resolved_status is not None else status)
 
-        sql = "SELECT * FROM incidents"
+        sql = _INCIDENT_SELECT_SQL
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += f" ORDER BY {order_by}"
@@ -819,23 +883,26 @@ class IncidentRepository(_BaseRepository):
             return None
         with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT * FROM incidents WHERE status != ? AND incident_key = ? ORDER BY id DESC LIMIT 1",
+                f"{_INCIDENT_SELECT_SQL} WHERE ist.name != ? AND i.incident_key = ? ORDER BY i.id DESC LIMIT 1",
                 (IncidentStatus.CLOSED.value, incident_key),
             ).fetchone()
             return _row_to_incident(row) if row is not None else None
 
     def find_open_by_computer_and_type(self, computer: str, incident_type: str) -> Incident | None:
         """Find the latest non-closed incident matching host and incident type."""
-        if not computer or not incident_type:
+        cleaned_comp = (computer or "").strip()
+        if not cleaned_comp or not incident_type:
             return None
+        resolved_type = IncidentType.resolve(incident_type)
+        type_name = resolved_type.value if resolved_type is not None else incident_type
         with self.db.connection() as conn:
             row = conn.execute(
-                """
-                SELECT * FROM incidents
-                WHERE status != ? AND computer = ? AND incident_type = ?
-                ORDER BY id DESC LIMIT 1
+                f"""
+                {_INCIDENT_SELECT_SQL}
+                WHERE ist.name != ? AND comp.hostname = ? AND it.name = ?
+                ORDER BY i.id DESC LIMIT 1
                 """,
-                (IncidentStatus.CLOSED.value, computer, incident_type),
+                (IncidentStatus.CLOSED.value, cleaned_comp, type_name),
             ).fetchone()
             return _row_to_incident(row) if row is not None else None
 
@@ -843,7 +910,7 @@ class IncidentRepository(_BaseRepository):
         """List all non-closed incidents."""
         with self.db.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM incidents WHERE status != ? ORDER BY id DESC",
+                f"{_INCIDENT_SELECT_SQL} WHERE ist.name != ? ORDER BY i.id DESC",
                 (IncidentStatus.CLOSED.value,),
             ).fetchall()
             return [_row_to_incident(r) for r in rows]
@@ -853,7 +920,7 @@ class IncidentRepository(_BaseRepository):
         prefix = f"{year:04d}-{month:02d}"
         with self.db.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM incidents WHERE substr(detected_at, 1, 7) = ? ORDER BY id DESC",
+                f"{_INCIDENT_SELECT_SQL} WHERE substr(i.detected_at, 1, 7) = ? ORDER BY i.id DESC",
                 (prefix,),
             ).fetchall()
             return [_row_to_incident(r) for r in rows]
@@ -863,7 +930,7 @@ class IncidentRepository(_BaseRepository):
         prefix = f"{year:04d}"
         with self.db.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM incidents WHERE substr(detected_at, 1, 4) = ? ORDER BY id DESC",
+                f"{_INCIDENT_SELECT_SQL} WHERE substr(i.detected_at, 1, 4) = ? ORDER BY i.id DESC",
                 (prefix,),
             ).fetchall()
             return [_row_to_incident(r) for r in rows]
@@ -877,43 +944,53 @@ class IncidentRepository(_BaseRepository):
         access_category = incident.access_category or incident.resolve_access_category().value
 
         with self.db.connection() as conn:
+            check_result_id, outcome_note = _resolve_outcome(conn, incident.outcome)
             cur = conn.execute(
                 """
                 INSERT INTO incidents (
-                    title, description, incident_type, severity, status, outcome,
-                    computer, employee, source, incident_key, has_personal_data,
-                    instruction_id, rkn_draft, detected_at, taken_at, closed_at,
-                    created_at, updated_at, access_category, assigned_to,
-                    rkn_sent_at, rkn_confirmation
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    title, description, incident_type_id, severity_id, status_id,
+                    check_result_id, outcome_note, computer_id, employee_id, source_id,
+                    incident_key, has_personal_data, instruction_id, detected_at,
+                    taken_at, closed_at, created_at, updated_at, access_category_id,
+                    assigned_to
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     incident.title,
                     incident.description,
-                    incident.incident_type,
-                    incident.severity,
-                    incident.status,
-                    incident.outcome,
-                    incident.computer,
-                    incident.employee,
-                    incident.source,
+                    _resolve_incident_type_id(conn, incident.incident_type),
+                    _resolve_severity_id(conn, incident.severity),
+                    _resolve_incident_status_id(conn, incident.status),
+                    check_result_id,
+                    outcome_note,
+                    _get_or_create_computer_id(conn, incident.computer),
+                    _get_or_create_employee_id(conn, incident.employee),
+                    _resolve_source_id(conn, incident.source),
                     incident.incident_key,
                     incident.has_personal_data,
                     incident.instruction_id,
-                    incident.rkn_draft,
                     detected_at,
                     incident.taken_at,
                     incident.closed_at,
                     created_at,
                     updated_at,
-                    access_category,
+                    _resolve_access_category_id(conn, access_category),
                     incident.assigned_to,
-                    incident.rkn_sent_at,
-                    incident.rkn_confirmation,
                 ),
             )
+            inc_id = int(cur.lastrowid)
+            _sync_regulator_notice(
+                conn,
+                inc_id,
+                incident.rkn_draft,
+                incident.rkn_sent_at,
+                incident.rkn_confirmation,
+            )
             conn.commit()
-            row = conn.execute("SELECT * FROM incidents WHERE id = ?", (cur.lastrowid,)).fetchone()
+            row = conn.execute(
+                f"{_INCIDENT_SELECT_SQL} WHERE i.id = ?",
+                (inc_id,),
+            ).fetchone()
             return _row_to_incident(row)
 
     def update(self, incident: Incident) -> Incident:
@@ -921,45 +998,55 @@ class IncidentRepository(_BaseRepository):
         if incident.id is None:
             raise ValueError("Incident id is required for update")
         updated_at = incident.updated_at or utc_now()
+        access_category = incident.access_category or incident.resolve_access_category().value
         with self.db.connection() as conn:
+            check_result_id, outcome_note = _resolve_outcome(conn, incident.outcome)
             conn.execute(
                 """
                 UPDATE incidents
-                SET title = ?, description = ?, incident_type = ?, severity = ?,
-                    status = ?, outcome = ?, computer = ?, employee = ?, source = ?,
+                SET title = ?, description = ?, incident_type_id = ?, severity_id = ?,
+                    status_id = ?, check_result_id = ?, outcome_note = ?,
+                    computer_id = ?, employee_id = ?, source_id = ?,
                     incident_key = ?, has_personal_data = ?, instruction_id = ?,
-                    rkn_draft = ?, detected_at = ?, taken_at = ?, closed_at = ?,
-                    updated_at = ?, access_category = ?, assigned_to = ?,
-                    rkn_sent_at = ?, rkn_confirmation = ?
+                    detected_at = ?, taken_at = ?, closed_at = ?,
+                    updated_at = ?, access_category_id = ?, assigned_to = ?
                 WHERE id = ?
                 """,
                 (
                     incident.title,
                     incident.description,
-                    incident.incident_type,
-                    incident.severity,
-                    incident.status,
-                    incident.outcome,
-                    incident.computer,
-                    incident.employee,
-                    incident.source,
+                    _resolve_incident_type_id(conn, incident.incident_type),
+                    _resolve_severity_id(conn, incident.severity),
+                    _resolve_incident_status_id(conn, incident.status),
+                    check_result_id,
+                    outcome_note,
+                    _get_or_create_computer_id(conn, incident.computer),
+                    _get_or_create_employee_id(conn, incident.employee),
+                    _resolve_source_id(conn, incident.source),
                     incident.incident_key,
                     incident.has_personal_data,
                     incident.instruction_id,
-                    incident.rkn_draft,
                     incident.detected_at,
                     incident.taken_at,
                     incident.closed_at,
                     updated_at,
-                    incident.access_category,
+                    _resolve_access_category_id(conn, access_category),
                     incident.assigned_to,
-                    incident.rkn_sent_at,
-                    incident.rkn_confirmation,
                     incident.id,
                 ),
             )
+            _sync_regulator_notice(
+                conn,
+                incident.id,
+                incident.rkn_draft,
+                incident.rkn_sent_at,
+                incident.rkn_confirmation,
+            )
             conn.commit()
-            row = conn.execute("SELECT * FROM incidents WHERE id = ?", (incident.id,)).fetchone()
+            row = conn.execute(
+                f"{_INCIDENT_SELECT_SQL} WHERE i.id = ?",
+                (incident.id,),
+            ).fetchone()
             return _row_to_incident(row)
 
     def touch_updated_at(self, incident_id: int, updated_at: str) -> None:
@@ -972,6 +1059,14 @@ class IncidentRepository(_BaseRepository):
             conn.commit()
 
 
+_MESSAGE_SELECT_SQL = """
+    SELECT m.id, m.incident_id, COALESCE(src.name, '') AS source,
+           m.sender, m.body, m.incident_key, m.received_at
+    FROM messages m
+    LEFT JOIN sources src ON src.id = m.source_id
+"""
+
+
 class MessageRepository(_BaseRepository):
     """Persistence operations for incoming incident messages."""
 
@@ -979,7 +1074,7 @@ class MessageRepository(_BaseRepository):
         """List messages attached to an incident in chronological order."""
         with self.db.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM messages WHERE incident_id = ? ORDER BY id ASC",
+                f"{_MESSAGE_SELECT_SQL} WHERE m.incident_id = ? ORDER BY m.id ASC",
                 (incident_id,),
             ).fetchall()
             return [
@@ -1007,15 +1102,19 @@ class MessageRepository(_BaseRepository):
         """Attach a new incoming message to an incident."""
         ts = received_at or utc_now()
         with self.db.connection() as conn:
+            source_id = _resolve_source_id(conn, source)
             cur = conn.execute(
                 """
-                INSERT INTO messages (incident_id, source, sender, body, incident_key, received_at)
+                INSERT INTO messages (incident_id, source_id, sender, body, incident_key, received_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (incident_id, source, sender, body, incident_key, ts),
+                (incident_id, source_id, sender, body, incident_key, ts),
             )
             conn.commit()
-            row = conn.execute("SELECT * FROM messages WHERE id = ?", (cur.lastrowid,)).fetchone()
+            row = conn.execute(
+                f"{_MESSAGE_SELECT_SQL} WHERE m.id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
             return IncomingMessage(
                 id=row["id"],
                 incident_id=row["incident_id"],
@@ -1027,6 +1126,15 @@ class MessageRepository(_BaseRepository):
             )
 
 
+_HISTORY_SELECT_SQL = """
+    SELECT h.id, h.incident_id, h.user_id, ha.code AS action,
+           h.details, h.created_at, u.username, u.full_name
+    FROM history h
+    JOIN history_actions ha ON ha.id = h.action_id
+    LEFT JOIN users u ON u.id = h.user_id
+"""
+
+
 class HistoryRepository(_BaseRepository):
     """Persistence operations for incident history logs."""
 
@@ -1034,13 +1142,7 @@ class HistoryRepository(_BaseRepository):
         """List incident history entries joined with actor names."""
         with self.db.connection() as conn:
             rows = conn.execute(
-                """
-                SELECT h.*, u.username, u.full_name
-                FROM history h
-                LEFT JOIN users u ON u.id = h.user_id
-                WHERE h.incident_id = ?
-                ORDER BY h.id ASC
-                """,
+                f"{_HISTORY_SELECT_SQL} WHERE h.incident_id = ? ORDER BY h.id ASC",
                 (incident_id,),
             ).fetchall()
             return [
@@ -1068,18 +1170,14 @@ class HistoryRepository(_BaseRepository):
         """Append a history record to an incident timeline."""
         ts = created_at or utc_now()
         with self.db.connection() as conn:
+            action_id = get_or_create_code_id(conn, "history_actions", action)
             cur = conn.execute(
-                "INSERT INTO history (incident_id, user_id, action, details, created_at) VALUES (?, ?, ?, ?, ?)",
-                (incident_id, user_id, action, details, ts),
+                "INSERT INTO history (incident_id, user_id, action_id, details, created_at) VALUES (?, ?, ?, ?, ?)",
+                (incident_id, user_id, action_id, details, ts),
             )
             conn.commit()
             row = conn.execute(
-                """
-                SELECT h.*, u.username, u.full_name
-                FROM history h
-                LEFT JOIN users u ON u.id = h.user_id
-                WHERE h.id = ?
-                """,
+                f"{_HISTORY_SELECT_SQL} WHERE h.id = ?",
                 (cur.lastrowid,),
             ).fetchone()
             return HistoryRecord(
@@ -1101,14 +1199,31 @@ class InstructionRepository(_BaseRepository):
         """Return all instruction templates ordered by id."""
         with self.db.connection() as conn:
             rows = conn.execute(
-                "SELECT id, title, incident_type, steps_json FROM instructions ORDER BY id"
+                """
+                SELECT i.id, i.title, it.name AS incident_type, i.version
+                FROM instructions i
+                JOIN incident_types it ON it.id = i.incident_type_id
+                ORDER BY i.id
+                """
             ).fetchall()
+            step_rows = conn.execute(
+                """
+                SELECT instruction_id, step_text
+                FROM instruction_steps
+                ORDER BY instruction_id ASC, step_index ASC
+                """
+            ).fetchall()
+            steps_by_inst: dict[int, list[str]] = {}
+            for sr in step_rows:
+                steps_by_inst.setdefault(sr["instruction_id"], []).append(sr["step_text"])
+
             return [
                 Instruction(
                     id=r["id"],
                     title=r["title"],
                     incident_type=r["incident_type"],
-                    steps=json.loads(r["steps_json"]),
+                    steps=steps_by_inst.get(r["id"], []),
+                    version=r["version"],
                 )
                 for r in rows
             ]
@@ -1117,24 +1232,47 @@ class InstructionRepository(_BaseRepository):
         """Fetch an instruction template by ID."""
         with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT id, title, incident_type, steps_json FROM instructions WHERE id = ?",
+                """
+                SELECT i.id, i.title, it.name AS incident_type, i.version
+                FROM instructions i
+                JOIN incident_types it ON it.id = i.incident_type_id
+                WHERE i.id = ?
+                """,
                 (instruction_id,),
             ).fetchone()
             if row is None:
                 return None
+            step_rows = conn.execute(
+                """
+                SELECT step_text
+                FROM instruction_steps
+                WHERE instruction_id = ?
+                ORDER BY step_index ASC
+                """,
+                (instruction_id,),
+            ).fetchall()
             return Instruction(
                 id=row["id"],
                 title=row["title"],
                 incident_type=row["incident_type"],
-                steps=json.loads(row["steps_json"]),
+                steps=[sr["step_text"] for sr in step_rows],
+                version=row["version"],
             )
 
     def find_default_id(self, incident_type: str) -> int | None:
         """Find the default instruction ID for an incident type."""
+        resolved = IncidentType.resolve(incident_type)
+        type_name = resolved.value if resolved is not None else incident_type
         with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT id FROM instructions WHERE incident_type = ? ORDER BY id ASC LIMIT 1",
-                (incident_type,),
+                """
+                SELECT i.id
+                FROM instructions i
+                JOIN incident_types it ON it.id = i.incident_type_id
+                WHERE it.name = ? OR it.code = ?
+                ORDER BY i.id ASC LIMIT 1
+                """,
+                (type_name, str(incident_type).strip().upper()),
             ).fetchone()
             return row["id"] if row else None
 
@@ -1142,7 +1280,12 @@ class InstructionRepository(_BaseRepository):
         """Return step completion records for an incident."""
         with self.db.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM step_progress WHERE incident_id = ? ORDER BY step_index ASC",
+                """
+                SELECT incident_id, step_index, completed, updated_by, updated_at
+                FROM step_progress
+                WHERE incident_id = ?
+                ORDER BY step_index ASC
+                """,
                 (incident_id,),
             ).fetchall()
             return [
@@ -1168,16 +1311,31 @@ class InstructionRepository(_BaseRepository):
         ts = updated_at or utc_now()
         completed_int = 1 if completed else 0
         with self.db.connection() as conn:
+            step_row = conn.execute(
+                """
+                SELECT s.id
+                FROM incidents i
+                JOIN instruction_steps s
+                    ON s.instruction_id = i.instruction_id
+                   AND s.step_index = ?
+                WHERE i.id = ?
+                """,
+                (step_index, incident_id),
+            ).fetchone()
+            inst_step_id = int(step_row["id"]) if step_row is not None else None
             conn.execute(
                 """
-                INSERT INTO step_progress (incident_id, step_index, completed, updated_by, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO step_progress (
+                    incident_id, step_index, instruction_step_id, completed, updated_by, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(incident_id, step_index) DO UPDATE SET
+                    instruction_step_id = excluded.instruction_step_id,
                     completed = excluded.completed,
                     updated_by = excluded.updated_by,
                     updated_at = excluded.updated_at
                 """,
-                (incident_id, step_index, completed_int, updated_by, ts),
+                (incident_id, step_index, inst_step_id, completed_int, updated_by, ts),
             )
             conn.commit()
         return InstructionProgress(
@@ -1189,13 +1347,25 @@ class InstructionRepository(_BaseRepository):
         )
 
 
+_TASK_SELECT_SQL = """
+    SELECT t.id, t.incident_id, t.title, t.description, t.assigned_to,
+           ts.name AS status, t.result, t.created_by, t.created_at,
+           t.completed_at, t.due_date
+    FROM tasks t
+    JOIN task_statuses ts ON ts.id = t.status_id
+"""
+
+
 class TaskRepository(_BaseRepository):
     """Persistence operations for incident tasks."""
 
     def get_by_id(self, task_id: int) -> Task | None:
         """Fetch a task by ID."""
         with self.db.connection() as conn:
-            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            row = conn.execute(
+                f"{_TASK_SELECT_SQL} WHERE t.id = ?",
+                (task_id,),
+            ).fetchone()
             return _row_to_task(row) if row is not None else None
 
     def get_with_incident_pdn(self, task_id: int) -> tuple[Task, int] | None:
@@ -1203,8 +1373,11 @@ class TaskRepository(_BaseRepository):
         with self.db.connection() as conn:
             row = conn.execute(
                 """
-                SELECT t.*, i.has_personal_data
+                SELECT t.id, t.incident_id, t.title, t.description, t.assigned_to,
+                       ts.name AS status, t.result, t.created_by, t.created_at,
+                       t.completed_at, t.due_date, i.has_personal_data
                 FROM tasks t
+                JOIN task_statuses ts ON ts.id = t.status_id
                 JOIN incidents i ON i.id = t.incident_id
                 WHERE t.id = ?
                 """,
@@ -1218,7 +1391,7 @@ class TaskRepository(_BaseRepository):
         """List tasks attached to an incident ordered by creation."""
         with self.db.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM tasks WHERE incident_id = ? ORDER BY id ASC",
+                f"{_TASK_SELECT_SQL} WHERE t.incident_id = ? ORDER BY t.id ASC",
                 (incident_id,),
             ).fetchall()
             return [_row_to_task(r) for r in rows]
@@ -1240,7 +1413,7 @@ class TaskRepository(_BaseRepository):
             params.append(assigned_to)
         if status:
             resolved_status = TaskStatus.resolve(status)
-            clauses.append("t.status = ?")
+            clauses.append("ts.name = ?")
             params.append(resolved_status.value if resolved_status is not None else status)
         if incident_id is not None:
             clauses.append("t.incident_id = ?")
@@ -1248,8 +1421,12 @@ class TaskRepository(_BaseRepository):
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
-            SELECT t.*, i.title AS incident_title, i.has_personal_data
+            SELECT t.id, t.incident_id, t.title, t.description, t.assigned_to,
+                   ts.name AS status, t.result, t.created_by, t.created_at,
+                   t.completed_at, t.due_date,
+                   i.title AS incident_title, i.has_personal_data
             FROM tasks t
+            JOIN task_statuses ts ON ts.id = t.status_id
             JOIN incidents i ON i.id = t.incident_id
             {where_sql}
             ORDER BY t.id DESC
@@ -1303,34 +1480,39 @@ class TaskRepository(_BaseRepository):
         """Create a new task and return the persisted Task model."""
         ts = created_at or utc_now()
         with self.db.connection() as conn:
+            status_id = _resolve_task_status_id(conn, status)
             cur = conn.execute(
                 """
                 INSERT INTO tasks (
                     incident_id, title, description, assigned_to,
-                    status, result, created_by, created_at, due_date
+                    status_id, result, created_by, created_at, due_date
                 ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)
                 """,
-                (incident_id, title, description, assigned_to, status, created_by, ts, due_date),
+                (incident_id, title, description, assigned_to, status_id, created_by, ts, due_date),
             )
             conn.commit()
-            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (cur.lastrowid,)).fetchone()
+            row = conn.execute(
+                f"{_TASK_SELECT_SQL} WHERE t.id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
             return _row_to_task(row)
 
     def update(self, task: Task) -> Task:
         """Persist task updates and return the reloaded Task model."""
         with self.db.connection() as conn:
+            status_id = _resolve_task_status_id(conn, task.status)
             conn.execute(
                 """
                 UPDATE tasks
                 SET title = ?, description = ?, assigned_to = ?,
-                    status = ?, result = ?, completed_at = ?, due_date = ?
+                    status_id = ?, result = ?, completed_at = ?, due_date = ?
                 WHERE id = ?
                 """,
                 (
                     task.title,
                     task.description,
                     task.assigned_to,
-                    task.status,
+                    status_id,
                     task.result,
                     task.completed_at,
                     task.due_date,
@@ -1338,8 +1520,23 @@ class TaskRepository(_BaseRepository):
                 ),
             )
             conn.commit()
-            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task.id,)).fetchone()
+            row = conn.execute(
+                f"{_TASK_SELECT_SQL} WHERE t.id = ?",
+                (task.id,),
+            ).fetchone()
             return _row_to_task(row)
+
+
+_NOTIFICATION_SELECT_SQL = """
+    SELECT n.id, n.incident_id, r.code AS recipient_role, n.recipient_name,
+           nk.code AS kind, n.message, n.created_at,
+           nc.name AS channel, ds.name AS status
+    FROM notifications n
+    JOIN roles r ON r.id = n.recipient_role_id
+    JOIN notification_kinds nk ON nk.id = n.kind_id
+    JOIN notification_channels nc ON nc.id = n.channel_id
+    JOIN delivery_statuses ds ON ds.id = n.status_id
+"""
 
 
 class NotificationRepository(_BaseRepository):
@@ -1349,10 +1546,59 @@ class NotificationRepository(_BaseRepository):
         """Return True if a notification of the given kind already exists for the incident."""
         with self.db.connection() as conn:
             row = conn.execute(
-                "SELECT 1 FROM notifications WHERE incident_id = ? AND kind = ?",
+                """
+                SELECT 1
+                FROM notifications n
+                JOIN notification_kinds nk ON nk.id = n.kind_id
+                WHERE n.incident_id = ? AND nk.code = ?
+                """,
                 (incident_id, kind),
             ).fetchone()
             return row is not None
+
+    def _insert_notification(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        incident_id: int | None,
+        recipient_role: str,
+        recipient_user_id: int | None,
+        recipient_name: str,
+        kind: str,
+        message: str,
+        created_at: str,
+        channel: str,
+        status: str,
+    ) -> Notification:
+        role_id = _resolve_role_id(conn, recipient_role)
+        kind_id = get_or_create_code_id(conn, "notification_kinds", kind)
+        channel_id = _resolve_channel_id(conn, channel)
+        status_id = _resolve_delivery_status_id(conn, status)
+        cur = conn.execute(
+            """
+            INSERT INTO notifications (
+                incident_id, recipient_role_id, recipient_user_id, recipient_name,
+                kind_id, message, created_at, channel_id, status_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                incident_id,
+                role_id,
+                recipient_user_id,
+                recipient_name,
+                kind_id,
+                message,
+                created_at,
+                channel_id,
+                status_id,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            f"{_NOTIFICATION_SELECT_SQL} WHERE n.id = ?",
+            (cur.lastrowid,),
+        ).fetchone()
+        return _row_to_notification(row)
 
     def create(
         self,
@@ -1364,36 +1610,25 @@ class NotificationRepository(_BaseRepository):
         created_at: str | None = None,
         channel: str = Channel.INTERNAL.value,
         status: str = DeliveryStatus.SENT.value,
+        recipient_user_id: int | None = None,
     ) -> Notification:
         """Insert a notification record and return the Notification domain model."""
         ts = created_at or utc_now()
         channel_val = channel.value if isinstance(channel, Channel) else str(channel)
         status_val = status.value if isinstance(status, DeliveryStatus) else str(status)
         with self.db.connection() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO notifications (
-                    incident_id, recipient_role, recipient_name,
-                    kind, message, created_at, channel, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    incident_id,
-                    recipient_role,
-                    recipient_name,
-                    kind,
-                    message,
-                    ts,
-                    channel_val,
-                    status_val,
-                ),
+            return self._insert_notification(
+                conn,
+                incident_id=incident_id,
+                recipient_role=recipient_role,
+                recipient_user_id=recipient_user_id,
+                recipient_name=recipient_name,
+                kind=kind,
+                message=message,
+                created_at=ts,
+                channel=channel_val,
+                status=status_val,
             )
-            conn.commit()
-            row = conn.execute(
-                "SELECT * FROM notifications WHERE id = ?",
-                (cur.lastrowid,),
-            ).fetchone()
-            return _row_to_notification(row)
 
     def create_if_new(
         self,
@@ -1405,6 +1640,7 @@ class NotificationRepository(_BaseRepository):
         created_at: str | None = None,
         channel: str = Channel.INTERNAL.value,
         status: str = DeliveryStatus.SENT.value,
+        recipient_user_id: int | None = None,
     ) -> Notification | None:
         """Insert a notification only if no prior notification shares (incident_id, kind)."""
         ts = created_at or utc_now()
@@ -1412,35 +1648,28 @@ class NotificationRepository(_BaseRepository):
         status_val = status.value if isinstance(status, DeliveryStatus) else str(status)
         with self.db.connection() as conn:
             exists = conn.execute(
-                "SELECT 1 FROM notifications WHERE incident_id = ? AND kind = ?",
+                """
+                SELECT 1
+                FROM notifications n
+                JOIN notification_kinds nk ON nk.id = n.kind_id
+                WHERE n.incident_id = ? AND nk.code = ?
+                """,
                 (incident_id, kind),
             ).fetchone()
             if exists is not None:
                 return None
-            cur = conn.execute(
-                """
-                INSERT INTO notifications (
-                    incident_id, recipient_role, recipient_name,
-                    kind, message, created_at, channel, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    incident_id,
-                    recipient_role,
-                    recipient_name,
-                    kind,
-                    message,
-                    ts,
-                    channel_val,
-                    status_val,
-                ),
+            return self._insert_notification(
+                conn,
+                incident_id=incident_id,
+                recipient_role=recipient_role,
+                recipient_user_id=recipient_user_id,
+                recipient_name=recipient_name,
+                kind=kind,
+                message=message,
+                created_at=ts,
+                channel=channel_val,
+                status=status_val,
             )
-            conn.commit()
-            row = conn.execute(
-                "SELECT * FROM notifications WHERE id = ?",
-                (cur.lastrowid,),
-            ).fetchone()
-            return _row_to_notification(row)
 
     def list_all(
         self,
@@ -1456,33 +1685,42 @@ class NotificationRepository(_BaseRepository):
         params: list[Any] = []
 
         if recipient_role and recipient_role.strip():
-            clauses.append("recipient_role = ?")
+            clauses.append("r.code = ?")
             params.append(recipient_role.strip())
         if q and q.strip():
-            clauses.append("(cfold(message) LIKE ? OR cfold(recipient_name) LIKE ?)")
+            clauses.append("(cfold(n.message) LIKE ? OR cfold(n.recipient_name) LIKE ?)")
             like = f"%{q.strip().casefold()}%"
             params.extend([like, like])
         if kind and kind.strip():
-            clauses.append("kind = ?")
+            clauses.append("nk.code = ?")
             params.append(kind.strip())
         if incident_id is not None:
-            clauses.append("incident_id = ?")
+            clauses.append("n.incident_id = ?")
             params.append(incident_id)
         if date_from and date_from.strip():
-            clauses.append("iso_utc(created_at) >= ?")
+            clauses.append("iso_utc(n.created_at) >= ?")
             params.append(_parse_date_bound(date_from, end_of_day=False))
         if date_to and date_to.strip():
-            clauses.append("iso_utc(created_at) <= ?")
+            clauses.append("iso_utc(n.created_at) <= ?")
             params.append(_parse_date_bound(date_to, end_of_day=True))
 
-        sql = "SELECT * FROM notifications"
+        sql = _NOTIFICATION_SELECT_SQL
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY id DESC"
+        sql += " ORDER BY n.id DESC"
 
         with self.db.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [_row_to_notification(r) for r in rows]
+
+
+_AUDIT_SELECT_SQL = """
+    SELECT a.id, a.user_id, ot.code AS object_type, a.object_id,
+           aa.code AS action, a.created_at
+    FROM audit_log a
+    JOIN audit_object_types ot ON ot.id = a.object_type_id
+    JOIN audit_actions aa ON aa.id = a.action_id
+"""
 
 
 class AuditRepository(_BaseRepository):
@@ -1499,15 +1737,20 @@ class AuditRepository(_BaseRepository):
         """Insert an audit_log record and return the AuditRecord model."""
         ts = created_at or utc_now()
         with self.db.connection() as conn:
+            obj_type_id = get_or_create_code_id(conn, "audit_object_types", object_type)
+            action_id = get_or_create_code_id(conn, "audit_actions", action)
             cur = conn.execute(
                 """
-                INSERT INTO audit_log (user_id, object_type, object_id, action, created_at)
+                INSERT INTO audit_log (user_id, object_type_id, object_id, action_id, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (user_id, object_type, object_id, action, ts),
+                (user_id, obj_type_id, object_id, action_id, ts),
             )
             conn.commit()
-            row = conn.execute("SELECT * FROM audit_log WHERE id = ?", (cur.lastrowid,)).fetchone()
+            row = conn.execute(
+                f"{_AUDIT_SELECT_SQL} WHERE a.id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
             return AuditRecord(
                 id=row["id"],
                 user_id=row["user_id"],
@@ -1521,7 +1764,7 @@ class AuditRepository(_BaseRepository):
         """Return recent audit log entries ordered newest first."""
         with self.db.connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?",
+                f"{_AUDIT_SELECT_SQL} ORDER BY a.id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [
@@ -1537,6 +1780,14 @@ class AuditRepository(_BaseRepository):
             ]
 
 
+_INGESTION_ERROR_SELECT_SQL = """
+    SELECT ie.id, COALESCE(src.name, ie.raw_source, '') AS source,
+           ie.error_text, ie.occurred_at, ie.resolved
+    FROM ingestion_errors ie
+    LEFT JOIN sources src ON src.id = ie.source_id
+"""
+
+
 class IngestionErrorRepository(_BaseRepository):
     """Persistence operations for signal ingestion failures."""
 
@@ -1549,17 +1800,24 @@ class IngestionErrorRepository(_BaseRepository):
     ) -> IngestionError:
         """Record a malformed signal or adapter ingestion error."""
         ts = occurred_at or utc_now()
+        cleaned_source = str(source or "").strip()
         with self.db.connection() as conn:
+            src_row = conn.execute(
+                "SELECT id FROM sources WHERE name = ? OR code = ?",
+                (cleaned_source, cleaned_source.upper()),
+            ).fetchone()
+            source_id = int(src_row["id"]) if src_row is not None else None
+            raw_source = "" if source_id is not None else cleaned_source
             cur = conn.execute(
                 """
-                INSERT INTO ingestion_errors (source, error_text, occurred_at, resolved)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO ingestion_errors (source_id, raw_source, error_text, occurred_at, resolved)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (source, error_text, ts, 1 if resolved else 0),
+                (source_id, raw_source, error_text, ts, 1 if resolved else 0),
             )
             conn.commit()
             row = conn.execute(
-                "SELECT * FROM ingestion_errors WHERE id = ?",
+                f"{_INGESTION_ERROR_SELECT_SQL} WHERE ie.id = ?",
                 (cur.lastrowid,),
             ).fetchone()
             return IngestionError(
@@ -1575,11 +1833,11 @@ class IngestionErrorRepository(_BaseRepository):
         with self.db.connection() as conn:
             if resolved is None:
                 rows = conn.execute(
-                    "SELECT * FROM ingestion_errors ORDER BY id DESC"
+                    f"{_INGESTION_ERROR_SELECT_SQL} ORDER BY ie.id DESC"
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM ingestion_errors WHERE resolved = ? ORDER BY id DESC",
+                    f"{_INGESTION_ERROR_SELECT_SQL} WHERE ie.resolved = ? ORDER BY ie.id DESC",
                     (1 if resolved else 0,),
                 ).fetchall()
             return [
@@ -1602,7 +1860,7 @@ class IngestionErrorRepository(_BaseRepository):
             )
             conn.commit()
             row = conn.execute(
-                "SELECT * FROM ingestion_errors WHERE id = ?",
+                f"{_INGESTION_ERROR_SELECT_SQL} WHERE ie.id = ?",
                 (error_id,),
             ).fetchone()
             if row is None:

@@ -116,7 +116,10 @@ class TestRoleAuthAndRbac(unittest.TestCase):
         conn = get_conn()
         try:
             conn.executemany(
-                "INSERT INTO users (username, password_hash, full_name, role) VALUES (?, ?, ?, ?)",
+                """
+                INSERT INTO users (username, password_hash, full_name, role_id)
+                VALUES (?, ?, ?, (SELECT id FROM roles WHERE code = ?))
+                """,
                 [(u, hash_password("password123"), name, role.value) for u, name, role in new_roles],
             )
             conn.commit()

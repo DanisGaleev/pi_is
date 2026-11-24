@@ -600,20 +600,48 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type = 'table'"
                     ).fetchall()
                 }
-                self.assertIn("audit_log", tables)
-                self.assertIn("ingestion_errors", tables)
+                expected_tables = {
+                    "roles",
+                    "incident_types",
+                    "severities",
+                    "incident_statuses",
+                    "check_results",
+                    "sources",
+                    "access_categories",
+                    "task_statuses",
+                    "notification_channels",
+                    "delivery_statuses",
+                    "notification_kinds",
+                    "history_actions",
+                    "audit_object_types",
+                    "audit_actions",
+                    "computers",
+                    "employees",
+                    "instruction_steps",
+                    "dispatch_rules",
+                    "dispatch_rule_urgent_roles",
+                    "regulator_notices",
+                    "audit_log",
+                    "ingestion_errors",
+                }
+                self.assertTrue(expected_tables.issubset(tables))
 
                 def cols(table: str) -> set[str]:
                     return {r["name"] for r in migrated.execute(f"PRAGMA table_info({table})").fetchall()}
 
-                self.assertIn("active", cols("users"))
-                self.assertIn("due_date", cols("tasks"))
+                self.assertTrue({"role_id", "active"}.issubset(cols("users")))
+                self.assertNotIn("role", cols("users"))
+                self.assertTrue({"status_id", "due_date"}.issubset(cols("tasks")))
+                self.assertNotIn("status", cols("tasks"))
                 self.assertTrue(
-                    {"access_category", "assigned_to", "rkn_sent_at", "rkn_confirmation"}.issubset(
+                    {"incident_type_id", "severity_id", "status_id", "access_category_id", "assigned_to"}.issubset(
                         cols("incidents")
                     )
                 )
-                self.assertTrue({"channel", "status"}.issubset(cols("notifications")))
+                self.assertFalse({"rkn_draft", "rkn_sent_at", "rkn_confirmation"}.intersection(cols("incidents")))
+                self.assertTrue({"recipient_role_id", "kind_id", "channel_id", "status_id"}.issubset(cols("notifications")))
+                self.assertTrue({"incident_type_id", "version"}.issubset(cols("instructions")))
+                self.assertNotIn("steps_json", cols("instructions"))
 
             container = AppContainer(db_path=db_path)
             users = container.user_repo.list_all()
