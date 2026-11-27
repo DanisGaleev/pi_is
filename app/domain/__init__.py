@@ -18,6 +18,8 @@ from app.domain.models import (
     ReportFile,
     Site,
     Task,
+    TelegramSettings,
+    TelegramSubscription,
     User,
 )
 
@@ -41,5 +43,7 @@ __all__ = [
     "ReportFile",
     "Site",
     "Task",
+    "TelegramSettings",
+    "TelegramSubscription",
     "User",
 ]

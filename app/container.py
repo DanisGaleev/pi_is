@@ -1,3 +1,4 @@
+from pathlib import Path
 from collections.abc import Callable
 
 from app.enums import SourceType
@@ -10,6 +11,7 @@ from app.integration.adapters import (
     TelegramAdapter,
 )
 from app.repositories.sqlite_repo import (
+    AttachmentRepository,
     AuditRepository,
     Database,
     HistoryRepository,
@@ -20,9 +22,11 @@ from app.repositories.sqlite_repo import (
     NotificationRepository,
     SessionRepository,
     TaskRepository,
+    TelegramRepository,
     UserRepository,
 )
 from app.services.access import AccessControlService
+from app.services.attachments import AttachmentService
 from app.services.dispatch import IncidentDispatcher
 from app.services.incidents import (
     DeduplicationService,
@@ -37,6 +41,7 @@ from app.services.ops import (
     ReportService,
     TaskService,
 )
+from app.services.telegram import TelegramNotificationService
 from app.services.users import UserService
 
 
@@ -47,6 +52,7 @@ class AppContainer:
         self,
         db_path: str | None = None,
         *,
+        upload_dir: str | Path | None = None,
         domain_available: bool = False,
         ad_verifier: Callable[[str, str], bool] | None = None,
     ) -> None:
@@ -59,7 +65,9 @@ class AppContainer:
         self.history_repo = HistoryRepository(self.db)
         self.instruction_repo = InstructionRepository(self.db)
         self.task_repo = TaskRepository(self.db)
+        self.attachment_repo = AttachmentRepository(self.db)
         self.notification_repo = NotificationRepository(self.db)
+        self.telegram_repo = TelegramRepository(self.db)
         self.audit_repo = AuditRepository(self.db)
         self.ingestion_error_repo = IngestionErrorRepository(self.db)
 
@@ -75,10 +83,19 @@ class AppContainer:
         self.access_service = AccessControlService(self.audit_repo)
         self.dispatcher = IncidentDispatcher()
         telegram = self.adapters.get(SourceType.TELEGRAM)
+        telegram_adapter = telegram if isinstance(telegram, TelegramAdapter) else None
         self.notification_service = NotificationService(
             notification_repo=self.notification_repo,
             user_repo=self.user_repo,
-            telegram_adapter=telegram if isinstance(telegram, TelegramAdapter) else None,
+            telegram_adapter=telegram_adapter,
+        )
+        self.telegram_service = TelegramNotificationService(
+            telegram_repo=self.telegram_repo,
+            notification_repo=self.notification_repo,
+            incident_repo=self.incident_repo,
+            user_repo=self.user_repo,
+            access_control=self.access_service,
+            telegram_adapter=telegram_adapter,
         )
         self.deduplication_service = DeduplicationService(
             incident_repo=self.incident_repo,
@@ -97,6 +114,7 @@ class AppContainer:
             dispatcher=self.dispatcher,
             user_repo=self.user_repo,
             notification_service=self.notification_service,
+            telegram_service=self.telegram_service,
         )
         self.incident_service = IncidentService(
             incident_repo=self.incident_repo,
@@ -107,6 +125,8 @@ class AppContainer:
             access_control=self.access_service,
             ingestion_service=self.ingestion_service,
             user_repo=self.user_repo,
+            telegram_service=self.telegram_service,
+            attachment_repo=self.attachment_repo,
         )
         self.user_service = UserService(self.user_repo)
         self.instruction_service = InstructionService(
@@ -121,6 +141,16 @@ class AppContainer:
             user_repo=self.user_repo,
             history_repo=self.history_repo,
             access_control=self.access_service,
+            attachment_repo=self.attachment_repo,
+        )
+        self.attachment_service = AttachmentService(
+            attachment_repo=self.attachment_repo,
+            incident_repo=self.incident_repo,
+            task_repo=self.task_repo,
+            history_repo=self.history_repo,
+            access_control=self.access_service,
+            user_repo=self.user_repo,
+            upload_dir=upload_dir,
         )
         self.deadline_service = DeadlineService(
             incident_repo=self.incident_repo,
@@ -133,6 +163,7 @@ class AppContainer:
             history_repo=self.history_repo,
             notification_service=self.notification_service,
             notification_repo=self.notification_repo,
+            telegram_service=self.telegram_service,
         )
         self.report_service = ReportService(self.incident_repo, dispatcher=self.dispatcher)
 

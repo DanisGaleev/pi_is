@@ -624,6 +624,7 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
                 self.assertIn("audit_log", tables)
                 self.assertIn("ingestion_errors", tables)
                 self.assertIn("task_assignees", tables)
+                self.assertIn("attachments", tables)
 
                 backfilled = migrated.execute(
                     "SELECT task_id, user_id, position FROM task_assignees WHERE task_id = 1"
@@ -635,6 +636,7 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
 
                 self.assertIn("active", cols("users"))
                 self.assertIn("due_date", cols("tasks"))
+                self.assertTrue({"task_id", "size_bytes"}.issubset(cols("attachments")))
                 self.assertTrue(
                     {"access_category", "assigned_to", "rkn_sent_at", "rkn_confirmation"}.issubset(
                         cols("incidents")

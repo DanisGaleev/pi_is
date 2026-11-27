@@ -2,6 +2,7 @@ from app.repositories.sqlite_repo import (
     DEFAULT_INCIDENT_SORT_BY,
     DEFAULT_INCIDENT_SORT_ORDER,
     SCHEMA_SQL,
+    AttachmentRepository,
     AuditRepository,
     Database,
     HistoryRepository,
@@ -12,6 +13,7 @@ from app.repositories.sqlite_repo import (
     NotificationRepository,
     SessionRepository,
     TaskRepository,
+    TelegramRepository,
     UserRepository,
     get_conn,
     hash_password,
@@ -21,6 +23,7 @@ from app.repositories.sqlite_repo import (
 )
 
 __all__ = [
+    "AttachmentRepository",
     "AuditRepository",
     "DEFAULT_INCIDENT_SORT_BY",
     "DEFAULT_INCIDENT_SORT_ORDER",
@@ -34,6 +37,7 @@ __all__ = [
     "SCHEMA_SQL",
     "SessionRepository",
     "TaskRepository",
+    "TelegramRepository",
     "UserRepository",
     "get_conn",
     "hash_password",

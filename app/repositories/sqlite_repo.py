@@ -10,6 +10,7 @@ from typing import Any
 
 from app.domain.models import (
     MAX_TASK_ASSIGNEES,
+    Attachment,
     AuditRecord,
     HistoryRecord,
     Incident,
@@ -19,6 +20,8 @@ from app.domain.models import (
     InstructionProgress,
     Notification,
     Task,
+    TelegramSettings,
+    TelegramSubscription,
     User,
 )
 from app.enums import (
@@ -184,6 +187,17 @@ CREATE TABLE IF NOT EXISTS task_assignees (
 
 CREATE INDEX IF NOT EXISTS idx_task_assignees_user_id ON task_assignees(user_id);
 
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    filename TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    uploaded_by INTEGER REFERENCES users(id),
+    uploaded_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id INTEGER REFERENCES incidents(id) ON DELETE CASCADE,
@@ -212,6 +226,33 @@ CREATE TABLE IF NOT EXISTS ingestion_errors (
     occurred_at TEXT NOT NULL,
     resolved INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS telegram_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    bot_token TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    webhook_secret TEXT NOT NULL DEFAULT '',
+    app_base_url TEXT NOT NULL DEFAULT '',
+    notify_on_create INTEGER NOT NULL DEFAULT 1,
+    notify_on_status INTEGER NOT NULL DEFAULT 1,
+    notify_on_escalation INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS telegram_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT UNIQUE NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    min_severity TEXT NOT NULL DEFAULT '{Severity.LOW.value}',
+    notify_on_create INTEGER NOT NULL DEFAULT 1,
+    notify_on_status INTEGER NOT NULL DEFAULT 1,
+    notify_on_escalation INTEGER NOT NULL DEFAULT 1,
+    include_pdn INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 _COLUMN_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
@@ -220,6 +261,10 @@ _COLUMN_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     "tasks": (
         ("due_date", "TEXT"),
+    ),
+    "attachments": (
+        ("task_id", "INTEGER REFERENCES tasks(id) ON DELETE SET NULL"),
+        ("size_bytes", "INTEGER NOT NULL DEFAULT 0"),
     ),
     "incidents": (
         ("access_category", "TEXT NOT NULL DEFAULT ''"),
@@ -244,6 +289,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         for col_name, col_def in columns:
             if col_name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_incident_id ON attachments(incident_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_task_id ON attachments(task_id)"
+    )
 
     conn.execute(
         """
@@ -550,6 +601,21 @@ def _row_to_task(row: sqlite3.Row, assignee_ids: Iterable[int] | None = None) ->
         completed_at=row["completed_at"],
         due_date=row["due_date"] if "due_date" in keys else None,
         assignee_ids=list(assignee_ids) if assignee_ids is not None else [],
+    )
+
+
+def _row_to_attachment(row: sqlite3.Row) -> Attachment:
+    keys = row.keys()
+    return Attachment(
+        id=row["id"],
+        incident_id=row["incident_id"],
+        filename=row["filename"],
+        mime_type=row["mime_type"],
+        path=row["path"],
+        uploaded_by=row["uploaded_by"],
+        uploaded_at=row["uploaded_at"],
+        task_id=row["task_id"] if "task_id" in keys else None,
+        size_bytes=int(row["size_bytes"]) if "size_bytes" in keys and row["size_bytes"] is not None else 0,
     )
 
 
@@ -1618,6 +1684,16 @@ class NotificationRepository(_BaseRepository):
             rows = conn.execute(sql, params).fetchall()
             return [_row_to_notification(r) for r in rows]
 
+    def update_status(self, notification_id: int, status: DeliveryStatus | str) -> None:
+        """Update delivery status for an existing notification record."""
+        status_val = status.value if isinstance(status, DeliveryStatus) else str(status)
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE notifications SET status = ? WHERE id = ?",
+                (status_val, notification_id),
+            )
+            conn.commit()
+
 
 class AuditRepository(_BaseRepository):
     """Persistence operations for access-control audit records."""
@@ -1748,3 +1824,308 @@ class IngestionErrorRepository(_BaseRepository):
                 occurred_at=row["occurred_at"],
                 resolved=bool(row["resolved"]),
             )
+
+
+def _row_to_tg_settings(row: sqlite3.Row) -> TelegramSettings:
+    return TelegramSettings(
+        id=row["id"],
+        bot_token=row["bot_token"],
+        enabled=bool(row["enabled"]),
+        webhook_secret=row["webhook_secret"],
+        app_base_url=row["app_base_url"],
+        notify_on_create=bool(row["notify_on_create"]),
+        notify_on_status=bool(row["notify_on_status"]),
+        notify_on_escalation=bool(row["notify_on_escalation"]),
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_tg_subscription(row: sqlite3.Row) -> TelegramSubscription:
+    return TelegramSubscription(
+        id=row["id"],
+        chat_id=row["chat_id"],
+        label=row["label"],
+        role=row["role"],
+        min_severity=row["min_severity"],
+        notify_on_create=bool(row["notify_on_create"]),
+        notify_on_status=bool(row["notify_on_status"]),
+        notify_on_escalation=bool(row["notify_on_escalation"]),
+        include_pdn=bool(row["include_pdn"]),
+        active=bool(row["active"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+class TelegramRepository(_BaseRepository):
+    """Persistence operations for Telegram bot configuration and chat subscriptions."""
+
+    def get_settings(self) -> TelegramSettings:
+        """Fetch singleton Telegram configuration row or return defaults."""
+        with self.db.connection() as conn:
+            row = conn.execute("SELECT * FROM telegram_settings WHERE id = 1").fetchone()
+            if row is None:
+                return TelegramSettings()
+            return _row_to_tg_settings(row)
+
+    def save_settings(self, settings: TelegramSettings) -> TelegramSettings:
+        """Insert or update singleton Telegram configuration row."""
+        now = settings.updated_at or utc_now()
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_settings (
+                    id, bot_token, enabled, webhook_secret, app_base_url,
+                    notify_on_create, notify_on_status, notify_on_escalation, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    bot_token = excluded.bot_token,
+                    enabled = excluded.enabled,
+                    webhook_secret = excluded.webhook_secret,
+                    app_base_url = excluded.app_base_url,
+                    notify_on_create = excluded.notify_on_create,
+                    notify_on_status = excluded.notify_on_status,
+                    notify_on_escalation = excluded.notify_on_escalation,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    settings.bot_token,
+                    1 if settings.enabled else 0,
+                    settings.webhook_secret,
+                    settings.app_base_url,
+                    1 if settings.notify_on_create else 0,
+                    1 if settings.notify_on_status else 0,
+                    1 if settings.notify_on_escalation else 0,
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM telegram_settings WHERE id = 1").fetchone()
+            return _row_to_tg_settings(row)
+
+    def list_subscriptions(self, *, active_only: bool = False) -> list[TelegramSubscription]:
+        """List Telegram chat subscriptions ordered by ID."""
+        sql = "SELECT * FROM telegram_subscriptions"
+        if active_only:
+            sql += " WHERE active = 1"
+        sql += " ORDER BY id ASC"
+        with self.db.connection() as conn:
+            rows = conn.execute(sql).fetchall()
+            return [_row_to_tg_subscription(r) for r in rows]
+
+    def get_subscription(self, sub_id: int) -> TelegramSubscription | None:
+        """Fetch a Telegram subscription by primary key ID."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM telegram_subscriptions WHERE id = ?",
+                (sub_id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row) if row is not None else None
+
+    def get_subscription_by_chat_id(self, chat_id: str) -> TelegramSubscription | None:
+        """Fetch a Telegram subscription by chat_id."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM telegram_subscriptions WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row) if row is not None else None
+
+    def upsert_subscription(self, sub: TelegramSubscription) -> TelegramSubscription:
+        """Create or update a subscription keyed by chat_id."""
+        now = sub.updated_at or utc_now()
+        created_at = sub.created_at or now
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_subscriptions (
+                    chat_id, label, role, min_severity,
+                    notify_on_create, notify_on_status, notify_on_escalation,
+                    include_pdn, active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    label = excluded.label,
+                    role = excluded.role,
+                    min_severity = excluded.min_severity,
+                    notify_on_create = excluded.notify_on_create,
+                    notify_on_status = excluded.notify_on_status,
+                    notify_on_escalation = excluded.notify_on_escalation,
+                    include_pdn = excluded.include_pdn,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    sub.chat_id,
+                    sub.label,
+                    sub.role,
+                    sub.min_severity,
+                    1 if sub.notify_on_create else 0,
+                    1 if sub.notify_on_status else 0,
+                    1 if sub.notify_on_escalation else 0,
+                    1 if sub.include_pdn else 0,
+                    1 if sub.active else 0,
+                    created_at,
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM telegram_subscriptions WHERE chat_id = ?",
+                (sub.chat_id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row)
+
+    def update_subscription(self, sub: TelegramSubscription) -> TelegramSubscription:
+        """Persist changes to an existing Telegram subscription."""
+        now = sub.updated_at or utc_now()
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                UPDATE telegram_subscriptions
+                SET label = ?, role = ?, min_severity = ?,
+                    notify_on_create = ?, notify_on_status = ?, notify_on_escalation = ?,
+                    include_pdn = ?, active = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    sub.label,
+                    sub.role,
+                    sub.min_severity,
+                    1 if sub.notify_on_create else 0,
+                    1 if sub.notify_on_status else 0,
+                    1 if sub.notify_on_escalation else 0,
+                    1 if sub.include_pdn else 0,
+                    1 if sub.active else 0,
+                    now,
+                    sub.id,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM telegram_subscriptions WHERE id = ?",
+                (sub.id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row)
+
+    def delete_subscription(self, sub_id: int) -> bool:
+        """Delete a Telegram subscription by ID."""
+        with self.db.connection() as conn:
+            cur = conn.execute("DELETE FROM telegram_subscriptions WHERE id = ?", (sub_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+class AttachmentRepository(_BaseRepository):
+    """Persistence operations for incident and task file attachments."""
+
+    def get_by_id(self, attachment_id: int) -> Attachment | None:
+        """Fetch an attachment metadata record by primary key."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?",
+                (attachment_id,),
+            ).fetchone()
+            return _row_to_attachment(row) if row is not None else None
+
+    def list_by_incident(
+        self,
+        incident_id: int,
+        task_id: int | None = None,
+    ) -> list[Attachment]:
+        """List attachments belonging to an incident, optionally filtered by task_id."""
+        with self.db.connection() as conn:
+            if task_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM attachments WHERE incident_id = ? AND task_id = ? ORDER BY id ASC",
+                    (incident_id, task_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM attachments WHERE incident_id = ? ORDER BY id ASC",
+                    (incident_id,),
+                ).fetchall()
+            return [_row_to_attachment(r) for r in rows]
+
+    def list_by_task(self, task_id: int) -> list[Attachment]:
+        """List attachments currently linked to a task."""
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM attachments WHERE task_id = ? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
+            return [_row_to_attachment(r) for r in rows]
+
+    def list_by_task_ids(self, task_ids: Iterable[int]) -> dict[int, list[Attachment]]:
+        """Batch-fetch attachments grouped by task_id."""
+        unique_ids = sorted({int(tid) for tid in task_ids if tid is not None})
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM attachments WHERE task_id IN ({placeholders}) ORDER BY id ASC",
+                unique_ids,
+            ).fetchall()
+        grouped: dict[int, list[Attachment]] = {}
+        for row in rows:
+            att = _row_to_attachment(row)
+            if att.task_id is not None:
+                grouped.setdefault(att.task_id, []).append(att)
+        return grouped
+
+    def create(
+        self,
+        incident_id: int,
+        filename: str,
+        mime_type: str,
+        path: str,
+        size_bytes: int,
+        uploaded_by: int | None,
+        uploaded_at: str | None = None,
+        task_id: int | None = None,
+    ) -> Attachment:
+        """Insert a new attachment metadata record and return the persisted model."""
+        ts = uploaded_at or utc_now()
+        with self.db.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO attachments (
+                    incident_id, task_id, filename, mime_type, path,
+                    size_bytes, uploaded_by, uploaded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (incident_id, task_id, filename, mime_type, path, size_bytes, uploaded_by, ts),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            return _row_to_attachment(row)
+
+    def update_task_id(self, attachment_id: int, task_id: int | None) -> Attachment | None:
+        """Link an attachment to a task or detach it (task_id=None)."""
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE attachments SET task_id = ? WHERE id = ?",
+                (task_id, attachment_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?",
+                (attachment_id,),
+            ).fetchone()
+            return _row_to_attachment(row) if row is not None else None
+
+    def delete(self, attachment_id: int) -> Attachment | None:
+        """Delete an attachment metadata record and return the deleted model."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?",
+                (attachment_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM attachments WHERE id = ?", (attachment_id,))
+            conn.commit()
+            return _row_to_attachment(row)

@@ -1,4 +1,5 @@
 from app.services.access import AccessControlService
+from app.services.attachments import AttachmentService
 from app.services.dispatch import DispatchRule, IncidentDispatcher
 from app.services.exceptions import (
     AccessDeniedError,
@@ -21,11 +22,13 @@ from app.services.ops import (
     ReportService,
     TaskService,
 )
+from app.services.telegram import TelegramNotificationService
 from app.services.users import UserService
 
 __all__ = [
     "AccessControlService",
     "AccessDeniedError",
+    "AttachmentService",
     "DeadlineService",
     "DeduplicationService",
     "DispatchRule",
@@ -39,6 +42,7 @@ __all__ = [
     "ReportService",
     "ServiceError",
     "TaskService",
+    "TelegramNotificationService",
     "UnauthorizedError",
     "UserService",
     "ValidationError",
