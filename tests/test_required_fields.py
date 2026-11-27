@@ -66,10 +66,7 @@ class TestRequiredFieldsHttp(unittest.TestCase):
             ("none_title", {**base, "title": None}, 422),
             ("empty_title", {**base, "title": ""}, 422),
             ("blank_title", {**base, "title": "   \t\n "}, 422),
-            ("missing_description", {k: v for k, v in base.items() if k != "description"}, 422),
-            ("none_description", {**base, "description": None}, 422),
-            ("empty_description", {**base, "description": ""}, 422),
-            ("blank_description", {**base, "description": "   "}, 422),
+            ("non_str_description", {**base, "description": 123}, 422),
             ("missing_assigned_to", {k: v for k, v in base.items() if k != "assigned_to"}, 422),
             ("none_assigned_to", {**base, "assigned_to": None}, 422),
             ("str_assigned_to", {**base, "assigned_to": "abc"}, 422),
@@ -79,10 +76,6 @@ class TestRequiredFieldsHttp(unittest.TestCase):
             ("negative_assigned_to", {**base, "assigned_to": -1}, 422),
             ("float_assigned_to", {**base, "assigned_to": 1.5}, 422),
             ("nonexistent_assigned_to", {**base, "assigned_to": 999999}, 404),
-            ("missing_due_date", {k: v for k, v in base.items() if k != "due_date"}, 422),
-            ("none_due_date", {**base, "due_date": None}, 422),
-            ("empty_due_date", {**base, "due_date": ""}, 422),
-            ("blank_due_date", {**base, "due_date": "   "}, 422),
             ("invalid_due_date_text", {**base, "due_date": "not-a-date"}, 422),
             ("invalid_due_date_month", {**base, "due_date": "2026-13-01T00:00:00Z"}, 422),
             ("invalid_due_date_ru", {**base, "due_date": "01.12.2026"}, 422),
@@ -92,6 +85,20 @@ class TestRequiredFieldsHttp(unittest.TestCase):
             with self.subTest(case=label):
                 resp = self.client.post("/api/incidents/1/tasks", json=payload, headers=self.ib_hdr)
                 self.assertEqual(resp.status_code, expected_status, resp.text)
+
+        # Optional description & due_date can be omitted, None, or blank
+        for label, opt_payload in (
+            ("minimal_required_only", {"title": "Минимальная задача", "assigned_to": self.sys_id}),
+            ("none_optional", {**base, "description": None, "due_date": None}),
+            ("blank_optional", {**base, "description": "   ", "due_date": "   "}),
+        ):
+            with self.subTest(case=label):
+                ok = self.client.post("/api/incidents/1/tasks", json=opt_payload, headers=self.ib_hdr)
+                self.assertEqual(ok.status_code, 200, ok.text)
+                body = ok.json()
+                self.assertEqual(body["description"], "")
+                self.assertIsNone(body["due_date"])
+                self.assertEqual(body["assigned_to"], self.sys_id)
 
         for valid_due in (
             "2026-12-01T15:30:00+00:00",
@@ -198,7 +205,7 @@ class TestRequiredFieldsHttp(unittest.TestCase):
     def test_incident_create_validation(self) -> None:
         base = self._valid_incident_payload()
 
-        for field in ("title", "description", "incident_type", "source"):
+        for field in ("title", "incident_type", "source"):
             for case_name, mutator in (
                 ("missing", lambda d, f=field: {k: v for k, v in d.items() if k != f}),
                 ("none", lambda d, f=field: {**d, f: None}),
@@ -209,11 +216,47 @@ class TestRequiredFieldsHttp(unittest.TestCase):
                     resp = self.client.post("/api/incidents", json=mutator(base), headers=self.ib_hdr)
                     self.assertEqual(resp.status_code, 422, resp.text)
 
-        ok = self.client.post("/api/incidents", json=base, headers=self.ib_hdr)
-        self.assertEqual(ok.status_code, 200, ok.text)
-        created = ok.json()
-        self.assertEqual(created["incident_type"], IncidentType.PHISHING.value)
-        self.assertEqual(created["source"], SourceType.EMAIL.value)
+        for bad_opt in (
+            {**base, "description": 123},
+            {**base, "severity": "extreme"},
+            {**base, "detected_at": "not-a-date"},
+        ):
+            with self.subTest(bad_opt=bad_opt):
+                resp = self.client.post("/api/incidents", json=bad_opt, headers=self.ib_hdr)
+                self.assertEqual(resp.status_code, 422, resp.text)
+
+        # Minimal required-only payload (optional fields omitted or None/blank) succeeds
+        for label, minimal_payload in (
+            (
+                "required_only",
+                {
+                    "title": "Подозрительное письмо",
+                    "incident_type": "phishing",
+                    "source": "mail_gateway",
+                },
+            ),
+            (
+                "none_and_blank_optional",
+                {
+                    "title": "Подозрительное письмо",
+                    "description": None,
+                    "incident_type": "phishing",
+                    "source": "mail_gateway",
+                    "severity": None,
+                    "computer": None,
+                    "employee": "   ",
+                    "detected_at": "",
+                },
+            ),
+        ):
+            with self.subTest(case=label):
+                ok = self.client.post("/api/incidents", json=minimal_payload, headers=self.ib_hdr)
+                self.assertEqual(ok.status_code, 200, ok.text)
+                created = ok.json()
+                self.assertEqual(created["incident_type"], IncidentType.PHISHING.value)
+                self.assertEqual(created["source"], SourceType.EMAIL.value)
+                self.assertEqual(created["description"], "")
+                self.assertEqual(created["severity"], "medium")
 
     def test_incident_close_requires_non_blank_outcome(self) -> None:
         inc_id = self.client.post(
@@ -329,19 +372,15 @@ class TestRequiredFieldsService(unittest.TestCase):
             {k: v for k, v in base.items() if k != "title"},
             {**base, "title": "   "},
             {**base, "title": None},
-            {k: v for k, v in base.items() if k != "description"},
-            {**base, "description": ""},
-            {**base, "description": "  \t "},
+            {**base, "description": 123},
             {k: v for k, v in base.items() if k != "assigned_to"},
             {**base, "assigned_to": None},
             {**base, "assigned_to": True},
             {**base, "assigned_to": str(self.sysadmin.id)},
             {**base, "assigned_to": 0},
             {**base, "assigned_to": 999999},
-            {k: v for k, v in base.items() if k != "due_date"},
-            {**base, "due_date": None},
-            {**base, "due_date": "   "},
             {**base, "due_date": "invalid-iso"},
+            {**base, "due_date": 123456},
         ]
         for bad in invalid_payloads:
             with self.subTest(bad=bad):
@@ -352,6 +391,15 @@ class TestRequiredFieldsService(unittest.TestCase):
                 )
                 with self.assertRaises(expected_exc):
                     task_svc.create_task(self.ib, 1, bad)
+
+        minimal = task_svc.create_task(
+            self.ib,
+            1,
+            {"title": "Минимальная задача", "assigned_to": self.sysadmin.id},
+        )
+        self.assertEqual(minimal["description"], "")
+        self.assertIsNone(minimal["due_date"])
+        self.assertEqual(minimal["assigned_to"], self.sysadmin.id)
 
         created = task_svc.create_task(self.ib, 1, base)
         self.assertEqual(created["assigned_to"], self.sysadmin.id)
@@ -403,7 +451,7 @@ class TestRequiredFieldsService(unittest.TestCase):
             "severity": "high",
         }
 
-        for field in ("title", "description", "incident_type", "source"):
+        for field in ("title", "incident_type", "source"):
             for bad_val in (None, "", "   "):
                 payload = {**base, field: bad_val}
                 with self.subTest(field=field, bad_val=bad_val):
@@ -414,6 +462,17 @@ class TestRequiredFieldsService(unittest.TestCase):
             with self.subTest(field=field, bad_val="OMITTED"):
                 with self.assertRaises(ValidationError):
                     inc_svc.create_incident(self.ib, omitted)
+
+        minimal_inc = inc_svc.create_incident(
+            self.ib,
+            {
+                "title": "Инцидент без опциональных полей",
+                "incident_type": "bruteforce",
+                "source": "zabbix",
+            },
+        )
+        self.assertEqual(minimal_inc["description"], "")
+        self.assertEqual(minimal_inc["severity"], "medium")
 
         inc = inc_svc.create_incident(self.ib, base)
         inc_id = inc["id"]

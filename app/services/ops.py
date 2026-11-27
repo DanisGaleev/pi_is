@@ -44,6 +44,8 @@ from app.services.exceptions import (
 )
 from app.services.users import enrich_tasks_with_users
 from app.services.validators import (
+    optional_iso_datetime,
+    optional_text,
     require_iso_datetime,
     require_non_blank,
     require_positive_int,
@@ -279,9 +281,9 @@ class TaskService:
             raise ValidationError("Данные задачи должны быть словарём")
 
         title = require_non_blank(data.get("title"), "title")
-        description = require_non_blank(data.get("description"), "description")
+        description = optional_text(data.get("description"), "description")
         assignee_ids = self._resolve_assignees_payload(data, allow_empty=False)
-        due_date = require_iso_datetime(data.get("due_date"), "due_date")
+        due_date = optional_iso_datetime(data.get("due_date"), "due_date")
 
         now = utc_now()
         task = self.task_repo.create(

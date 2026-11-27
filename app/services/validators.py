@@ -31,6 +31,33 @@ def require_iso_datetime(value: Any, field_name: str) -> str:
     return cleaned
 
 
+def optional_text(value: Any, field_name: str) -> str:
+    """Normalize an optional text field, rejecting non-string non-None values."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValidationError(f"Поле '{field_name}' должно быть строкой")
+    return value.strip()
+
+
+def optional_iso_datetime(value: Any, field_name: str) -> str | None:
+    """Validate an optional ISO-8601 date/datetime string, returning None if blank."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValidationError(f"Поле '{field_name}' должно быть строкой")
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    try:
+        datetime.fromisoformat(cleaned)
+    except ValueError as exc:
+        raise ValidationError(
+            f"Поле '{field_name}' должно быть корректной датой/временем в формате ISO-8601"
+        ) from exc
+    return cleaned
+
+
 def require_non_blank_enum_input(
     value: Any,
     enum_cls: type[StrEnum],

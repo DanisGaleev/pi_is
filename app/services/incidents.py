@@ -39,7 +39,12 @@ from app.services.exceptions import (
 )
 from app.services.ops import NotificationService
 from app.services.users import enrich_tasks_with_users
-from app.services.validators import require_non_blank, require_non_blank_enum_input
+from app.services.validators import (
+    optional_iso_datetime,
+    optional_text,
+    require_non_blank,
+    require_non_blank_enum_input,
+)
 
 if TYPE_CHECKING:
     from app.services.telegram import TelegramNotificationService
@@ -397,7 +402,7 @@ class IngestionService:
         )
 
         title = require_non_blank(data.get("title"), "title")
-        description = require_non_blank(data.get("description"), "description")
+        description = optional_text(data.get("description"), "description")
         raw_type = require_non_blank_enum_input(
             data.get("incident_type"), IncidentType, "incident_type"
         )
@@ -405,13 +410,17 @@ class IngestionService:
 
         incident_type = IncidentType.normalize(raw_type).value
         source = SourceType.normalize(raw_source).value
-        try:
-            severity = Severity.normalize(data.get("severity", Severity.MEDIUM)).value
-        except ValueError as exc:
-            raise ValidationError(str(exc)) from exc
+        raw_severity = data.get("severity")
+        if raw_severity is None or (isinstance(raw_severity, str) and not raw_severity.strip()):
+            severity = Severity.MEDIUM.value
+        else:
+            try:
+                severity = Severity.normalize(raw_severity).value
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
 
         now = utc_now()
-        detected_at = data.get("detected_at") or now
+        detected_at = optional_iso_datetime(data.get("detected_at"), "detected_at") or now
         instruction_id = data.get("instruction_id")
         if instruction_id is None:
             instruction_id = self.instruction_repo.find_default_id(incident_type)
@@ -422,10 +431,10 @@ class IngestionService:
             incident_type=incident_type,
             severity=severity,
             status=IncidentStatus.NEW.value,
-            computer=str(data.get("computer") or ""),
-            employee=str(data.get("employee") or ""),
+            computer=optional_text(data.get("computer"), "computer"),
+            employee=optional_text(data.get("employee"), "employee"),
             source=source,
-            incident_key=str(data.get("incident_key") or ""),
+            incident_key=optional_text(data.get("incident_key"), "incident_key"),
             has_personal_data=has_pd,
             instruction_id=instruction_id,
             detected_at=detected_at,
