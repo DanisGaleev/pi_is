@@ -1,12 +1,14 @@
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, BeforeValidator, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, field_validator, model_validator
 
 from app.container import container
 from app.enums import TaskStatus
 from app.services.exceptions import ValidationError
 from app.services.validators import (
+    optional_iso_datetime,
+    optional_text,
     require_iso_datetime,
     require_non_blank,
     require_positive_int,
@@ -34,15 +36,20 @@ class StepUpdate(BaseModel):
 
 class TaskCreate(BaseModel):
     title: str
-    description: str
+    description: str = ""
     assigned_to: int | None = None
     assignee_ids: list[int] | None = None
-    due_date: str
+    due_date: str | None = None
 
-    @field_validator("title", "description", mode="before")
+    @field_validator("title", mode="before")
     @classmethod
-    def _validate_non_blank(cls, value: Any, info: ValidationInfo) -> str:
-        return require_non_blank(value, info.field_name or "field")
+    def _validate_title(cls, value: Any) -> str:
+        return require_non_blank(value, "title")
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def _validate_description(cls, value: Any) -> str:
+        return optional_text(value, "description")
 
     @field_validator("assigned_to", mode="before")
     @classmethod
@@ -60,8 +67,8 @@ class TaskCreate(BaseModel):
 
     @field_validator("due_date", mode="before")
     @classmethod
-    def _validate_due_date(cls, value: Any) -> str:
-        return require_iso_datetime(value, "due_date")
+    def _validate_due_date(cls, value: Any) -> str | None:
+        return optional_iso_datetime(value, "due_date")
 
     @model_validator(mode="after")
     def _validate_any_assignee(self) -> "TaskCreate":

@@ -17,7 +17,12 @@ from app.repositories.sqlite_repo import (
 )
 from app.services.exceptions import ValidationError
 from app.services.incidents import normalize_outcome
-from app.services.validators import require_non_blank, require_non_blank_enum_input
+from app.services.validators import (
+    optional_iso_datetime,
+    optional_text,
+    require_non_blank,
+    require_non_blank_enum_input,
+)
 from auth import get_current_user
 from routers import call_service
 
@@ -56,7 +61,7 @@ NormalizedOutcome = Annotated[str | None, BeforeValidator(normalize_outcome)]
 
 class IncidentCreate(BaseModel):
     title: str
-    description: str
+    description: str = ""
     incident_type: RequiredIncidentType
     severity: NormalizedSeverity = Severity.MEDIUM
     computer: str = ""
@@ -67,10 +72,27 @@ class IncidentCreate(BaseModel):
     instruction_id: int | None = None
     detected_at: str | None = None
 
-    @field_validator("title", "description", mode="before")
+    @field_validator("title", mode="before")
     @classmethod
-    def _validate_non_blank(cls, value: Any, info: ValidationInfo) -> str:
-        return require_non_blank(value, info.field_name or "field")
+    def _validate_title(cls, value: Any) -> str:
+        return require_non_blank(value, "title")
+
+    @field_validator("description", "computer", "employee", "incident_key", mode="before")
+    @classmethod
+    def _validate_optional_text(cls, value: Any, info: ValidationInfo) -> str:
+        return optional_text(value, info.field_name or "field")
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _default_optional_severity(cls, value: Any) -> Any:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return Severity.MEDIUM
+        return value
+
+    @field_validator("detected_at", mode="before")
+    @classmethod
+    def _validate_detected_at(cls, value: Any) -> str | None:
+        return optional_iso_datetime(value, "detected_at")
 
 
 class IncidentUpdate(BaseModel):
