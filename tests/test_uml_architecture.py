@@ -621,10 +621,36 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
                         "SELECT name FROM sqlite_master WHERE type = 'table'"
                     ).fetchall()
                 }
-                self.assertIn("audit_log", tables)
-                self.assertIn("ingestion_errors", tables)
-                self.assertIn("task_assignees", tables)
-                self.assertIn("attachments", tables)
+                expected_tables = {
+                    "roles",
+                    "incident_types",
+                    "severities",
+                    "incident_statuses",
+                    "check_results",
+                    "sources",
+                    "access_categories",
+                    "task_statuses",
+                    "notification_channels",
+                    "delivery_statuses",
+                    "notification_kinds",
+                    "history_actions",
+                    "audit_object_types",
+                    "audit_actions",
+                    "mime_types",
+                    "computers",
+                    "employees",
+                    "instruction_steps",
+                    "dispatch_rules",
+                    "dispatch_rule_urgent_roles",
+                    "regulator_notices",
+                    "task_assignees",
+                    "attachments",
+                    "telegram_settings",
+                    "telegram_subscriptions",
+                    "audit_log",
+                    "ingestion_errors",
+                }
+                self.assertTrue(expected_tables.issubset(tables))
 
                 backfilled = migrated.execute(
                     "SELECT task_id, user_id, position FROM task_assignees WHERE task_id = 1"
@@ -634,15 +660,23 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
                 def cols(table: str) -> set[str]:
                     return {r["name"] for r in migrated.execute(f"PRAGMA table_info({table})").fetchall()}
 
-                self.assertIn("active", cols("users"))
-                self.assertIn("due_date", cols("tasks"))
-                self.assertTrue({"task_id", "size_bytes"}.issubset(cols("attachments")))
+                self.assertTrue({"role_id", "active"}.issubset(cols("users")))
+                self.assertNotIn("role", cols("users"))
+                self.assertTrue({"status_id", "due_date"}.issubset(cols("tasks")))
+                self.assertFalse({"status", "assigned_to"}.intersection(cols("tasks")))
+                self.assertTrue({"task_id", "size_bytes", "mime_type_id"}.issubset(cols("attachments")))
+                self.assertNotIn("mime_type", cols("attachments"))
+                self.assertTrue({"role_id", "min_severity_id"}.issubset(cols("telegram_subscriptions")))
+                self.assertFalse({"role", "min_severity"}.intersection(cols("telegram_subscriptions")))
                 self.assertTrue(
-                    {"access_category", "assigned_to", "rkn_sent_at", "rkn_confirmation"}.issubset(
+                    {"incident_type_id", "severity_id", "status_id", "access_category_id", "assigned_to"}.issubset(
                         cols("incidents")
                     )
                 )
-                self.assertTrue({"channel", "status"}.issubset(cols("notifications")))
+                self.assertFalse({"rkn_draft", "rkn_sent_at", "rkn_confirmation"}.intersection(cols("incidents")))
+                self.assertTrue({"recipient_role_id", "kind_id", "channel_id", "status_id"}.issubset(cols("notifications")))
+                self.assertTrue({"incident_type_id", "version"}.issubset(cols("instructions")))
+                self.assertNotIn("steps_json", cols("instructions"))
 
             container = AppContainer(db_path=db_path)
             users = container.user_repo.list_all()

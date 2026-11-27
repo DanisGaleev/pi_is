@@ -708,6 +708,7 @@ class NotificationService:
             target = str(recipient).strip()
             if not target:
                 continue
+            recipient_user_id: int | None = None
             try:
                 role = Role(target)
                 role_val = role.value
@@ -717,9 +718,9 @@ class NotificationService:
                 if user is not None:
                     role_val = user.role.value if isinstance(user.role, Role) else str(user.role)
                     display_name = user.full_name
+                    recipient_user_id = user.id
                 else:
-                    role_val = target
-                    display_name = target
+                    raise ValidationError(f"Неизвестный получатель уведомления: {target!r}")
 
             notif = self.notification_repo.create(
                 incident_id=None,
@@ -730,6 +731,7 @@ class NotificationService:
                 created_at=now,
                 channel=Channel.INTERNAL.value,
                 status=DeliveryStatus.SENT.value,
+                recipient_user_id=recipient_user_id,
             )
             created.append(notif.to_dict())
 
