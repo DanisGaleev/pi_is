@@ -16,6 +16,7 @@ from app.enums import (
 )
 from app.integration.adapters import TelegramAdapter
 from app.repositories.sqlite_repo import (
+    AttachmentRepository,
     HistoryRepository,
     IncidentRepository,
     InstructionRepository,
@@ -25,6 +26,7 @@ from app.repositories.sqlite_repo import (
     utc_now,
 )
 from app.services.access import AccessControlService
+from app.services.attachments import enrich_tasks_with_attachments
 from app.services.dispatch import IncidentDispatcher
 from app.services.exceptions import (
     AccessDeniedError,
@@ -120,12 +122,21 @@ class TaskService:
         user_repo: UserRepository,
         history_repo: HistoryRepository,
         access_control: AccessControlService,
+        attachment_repo: AttachmentRepository | None = None,
     ) -> None:
         self.task_repo = task_repo
         self.incident_repo = incident_repo
         self.user_repo = user_repo
         self.history_repo = history_repo
         self.access_control = access_control
+        self.attachment_repo = attachment_repo or AttachmentRepository(task_repo.db)
+
+    def _enrich_tasks(self, tasks: list[Any]) -> list[dict[str, Any]]:
+        return enrich_tasks_with_attachments(
+            enrich_tasks_with_users(tasks, self.user_repo),
+            self.attachment_repo,
+            self.user_repo,
+        )
 
     def _validate_assignee(self, assigned_to: Any) -> User:
         """Validate that an explicit assignee ID belongs to an existing active user."""
@@ -185,7 +196,7 @@ class TaskService:
             created_at=now,
         )
         self.access_control.log_access(actor.id, "task", task.id, "create")
-        return enrich_tasks_with_users([task], self.user_repo)[0]
+        return self._enrich_tasks([task])[0]
 
     def list_tasks(
         self,
@@ -213,7 +224,7 @@ class TaskService:
             incident_id=incident_id,
             exclude_personal_data=exclude_pdn,
         )
-        return enrich_tasks_with_users(rows, self.user_repo)
+        return self._enrich_tasks(rows)
 
     def update_task(
         self,
@@ -294,7 +305,7 @@ class TaskService:
             created_at=now,
         )
         self.access_control.log_access(actor.id, "task", task_id, "update")
-        return enrich_tasks_with_users([updated], self.user_repo)[0]
+        return self._enrich_tasks([updated])[0]
 
     def list_overdue(self, user: User | Mapping[str, Any]) -> list[dict[str, Any]]:
         """Return overdue tasks visible to the user."""
@@ -304,7 +315,7 @@ class TaskService:
         now_dt = datetime.now(timezone.utc)
         tasks = self.task_repo.list_filtered(exclude_personal_data=exclude_pdn)
         overdue = [task for task in tasks if task.is_overdue(now_dt)]
-        return enrich_tasks_with_users(overdue, self.user_repo)
+        return self._enrich_tasks(overdue)
 
 
 class DeadlineService:

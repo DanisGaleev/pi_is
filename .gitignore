@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-# Local databases & Frontend
+# Local databases, uploads & Frontend
 *.db
+uploads/
 node_modules/

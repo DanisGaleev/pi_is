@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.domain.models import (
+    Attachment,
     AuditRecord,
     HistoryRecord,
     Incident,
@@ -175,6 +176,18 @@ CREATE TABLE IF NOT EXISTS tasks (
     due_date TEXT
 );
 
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    filename TEXT NOT NULL,
+    mime_type TEXT NOT NULL,
+    path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    uploaded_by INTEGER REFERENCES users(id),
+    uploaded_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id INTEGER REFERENCES incidents(id) ON DELETE CASCADE,
@@ -239,6 +252,10 @@ _COLUMN_MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "tasks": (
         ("due_date", "TEXT"),
     ),
+    "attachments": (
+        ("task_id", "INTEGER REFERENCES tasks(id) ON DELETE SET NULL"),
+        ("size_bytes", "INTEGER NOT NULL DEFAULT 0"),
+    ),
     "incidents": (
         ("access_category", "TEXT NOT NULL DEFAULT ''"),
         ("assigned_to", "INTEGER REFERENCES users(id)"),
@@ -262,6 +279,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         for col_name, col_def in columns:
             if col_name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def}")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_incident_id ON attachments(incident_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_attachments_task_id ON attachments(task_id)"
+    )
 
 
 def _seed(conn: sqlite3.Connection) -> None:
@@ -555,6 +578,21 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         created_at=row["created_at"],
         completed_at=row["completed_at"],
         due_date=row["due_date"] if "due_date" in keys else None,
+    )
+
+
+def _row_to_attachment(row: sqlite3.Row) -> Attachment:
+    keys = row.keys()
+    return Attachment(
+        id=row["id"],
+        incident_id=row["incident_id"],
+        filename=row["filename"],
+        mime_type=row["mime_type"],
+        path=row["path"],
+        uploaded_by=row["uploaded_by"],
+        uploaded_at=row["uploaded_at"],
+        task_id=row["task_id"] if "task_id" in keys else None,
+        size_bytes=int(row["size_bytes"]) if "size_bytes" in keys and row["size_bytes"] is not None else 0,
     )
 
 
@@ -1842,3 +1880,119 @@ class TelegramRepository(_BaseRepository):
             cur = conn.execute("DELETE FROM telegram_subscriptions WHERE id = ?", (sub_id,))
             conn.commit()
             return cur.rowcount > 0
+
+
+class AttachmentRepository(_BaseRepository):
+    """Persistence operations for incident and task file attachments."""
+
+    def get_by_id(self, attachment_id: int) -> Attachment | None:
+        """Fetch an attachment metadata record by primary key."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?",
+                (attachment_id,),
+            ).fetchone()
+            return _row_to_attachment(row) if row is not None else None
+
+    def list_by_incident(
+        self,
+        incident_id: int,
+        task_id: int | None = None,
+    ) -> list[Attachment]:
+        """List attachments belonging to an incident, optionally filtered by task_id."""
+        with self.db.connection() as conn:
+            if task_id is not None:
+                rows = conn.execute(
+                    "SELECT * FROM attachments WHERE incident_id = ? AND task_id = ? ORDER BY id ASC",
+                    (incident_id, task_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM attachments WHERE incident_id = ? ORDER BY id ASC",
+                    (incident_id,),
+                ).fetchall()
+            return [_row_to_attachment(r) for r in rows]
+
+    def list_by_task(self, task_id: int) -> list[Attachment]:
+        """List attachments currently linked to a task."""
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM attachments WHERE task_id = ? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
+            return [_row_to_attachment(r) for r in rows]
+
+    def list_by_task_ids(self, task_ids: Iterable[int]) -> dict[int, list[Attachment]]:
+        """Batch-fetch attachments grouped by task_id."""
+        unique_ids = sorted({int(tid) for tid in task_ids if tid is not None})
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM attachments WHERE task_id IN ({placeholders}) ORDER BY id ASC",
+                unique_ids,
+            ).fetchall()
+        grouped: dict[int, list[Attachment]] = {}
+        for row in rows:
+            att = _row_to_attachment(row)
+            if att.task_id is not None:
+                grouped.setdefault(att.task_id, []).append(att)
+        return grouped
+
+    def create(
+        self,
+        incident_id: int,
+        filename: str,
+        mime_type: str,
+        path: str,
+        size_bytes: int,
+        uploaded_by: int | None,
+        uploaded_at: str | None = None,
+        task_id: int | None = None,
+    ) -> Attachment:
+        """Insert a new attachment metadata record and return the persisted model."""
+        ts = uploaded_at or utc_now()
+        with self.db.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO attachments (
+                    incident_id, task_id, filename, mime_type, path,
+                    size_bytes, uploaded_by, uploaded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (incident_id, task_id, filename, mime_type, path, size_bytes, uploaded_by, ts),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            return _row_to_attachment(row)
+
+    def update_task_id(self, attachment_id: int, task_id: int | None) -> Attachment | None:
+        """Link an attachment to a task or detach it (task_id=None)."""
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE attachments SET task_id = ? WHERE id = ?",
+                (task_id, attachment_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?",
+                (attachment_id,),
+            ).fetchone()
+            return _row_to_attachment(row) if row is not None else None
+
+    def delete(self, attachment_id: int) -> Attachment | None:
+        """Delete an attachment metadata record and return the deleted model."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM attachments WHERE id = ?",
+                (attachment_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM attachments WHERE id = ?", (attachment_id,))
+            conn.commit()
+            return _row_to_attachment(row)

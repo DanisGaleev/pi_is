@@ -14,6 +14,7 @@ from app.integration.adapters import ADAPTER_REGISTRY, SourceAdapter, TelegramAd
 from app.repositories.sqlite_repo import (
     DEFAULT_INCIDENT_SORT_BY,
     DEFAULT_INCIDENT_SORT_ORDER,
+    AttachmentRepository,
     HistoryRepository,
     IncidentRepository,
     IngestionErrorRepository,
@@ -25,6 +26,10 @@ from app.repositories.sqlite_repo import (
     utc_now,
 )
 from app.services.access import AccessControlService
+from app.services.attachments import (
+    enrich_attachments_with_users,
+    enrich_tasks_with_attachments,
+)
 from app.services.dispatch import IncidentDispatcher
 from app.services.exceptions import (
     AccessDeniedError,
@@ -455,6 +460,7 @@ class IncidentService:
         ingestion_service: IngestionService,
         user_repo: UserRepository | None = None,
         telegram_service: "TelegramNotificationService | None" = None,
+        attachment_repo: AttachmentRepository | None = None,
     ) -> None:
         self.incident_repo = incident_repo
         self.message_repo = message_repo
@@ -465,6 +471,7 @@ class IncidentService:
         self.ingestion_service = ingestion_service
         self.user_repo = user_repo or UserRepository(task_repo.db)
         self.telegram_service = telegram_service
+        self.attachment_repo = attachment_repo or AttachmentRepository(task_repo.db)
 
     def list_incidents(
         self,
@@ -523,8 +530,16 @@ class IncidentService:
             }
             for p in self.instruction_repo.list_progress(incident_id)
         ]
-        data["tasks"] = enrich_tasks_with_users(
-            self.task_repo.list_by_incident(incident_id),
+        data["tasks"] = enrich_tasks_with_attachments(
+            enrich_tasks_with_users(
+                self.task_repo.list_by_incident(incident_id),
+                self.user_repo,
+            ),
+            self.attachment_repo,
+            self.user_repo,
+        )
+        data["attachments"] = enrich_attachments_with_users(
+            self.attachment_repo.list_by_incident(incident_id),
             self.user_repo,
         )
         return data

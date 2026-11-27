@@ -602,12 +602,14 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
                 }
                 self.assertIn("audit_log", tables)
                 self.assertIn("ingestion_errors", tables)
+                self.assertIn("attachments", tables)
 
                 def cols(table: str) -> set[str]:
                     return {r["name"] for r in migrated.execute(f"PRAGMA table_info({table})").fetchall()}
 
                 self.assertIn("active", cols("users"))
                 self.assertIn("due_date", cols("tasks"))
+                self.assertTrue({"task_id", "size_bytes"}.issubset(cols("attachments")))
                 self.assertTrue(
                     {"access_category", "assigned_to", "rkn_sent_at", "rkn_confirmation"}.issubset(
                         cols("incidents")
