@@ -19,6 +19,15 @@ router = APIRouter(prefix="/api", tags=["ops"])
 NormalizedTaskStatus = Annotated[TaskStatus, BeforeValidator(TaskStatus.normalize)]
 
 
+def _validate_positive_int_list(value: Any, field_name: str, *, allow_empty: bool) -> list[int]:
+    """Validate a JSON list of positive non-bool integers."""
+    if not isinstance(value, list):
+        raise ValidationError(f"Поле '{field_name}' должно быть списком")
+    if not allow_empty and not value:
+        raise ValidationError(f"Поле '{field_name}' не может быть пустым")
+    return [require_positive_int(item, field_name) for item in value]
+
+
 class StepUpdate(BaseModel):
     completed: bool
 
@@ -26,7 +35,8 @@ class StepUpdate(BaseModel):
 class TaskCreate(BaseModel):
     title: str
     description: str
-    assigned_to: int
+    assigned_to: int | None = None
+    assignee_ids: list[int] | None = None
     due_date: str
 
     @field_validator("title", "description", mode="before")
@@ -36,19 +46,57 @@ class TaskCreate(BaseModel):
 
     @field_validator("assigned_to", mode="before")
     @classmethod
-    def _validate_assigned_to(cls, value: Any) -> int:
+    def _validate_assigned_to(cls, value: Any) -> int | None:
+        if value is None:
+            return None
         return require_positive_int(value, "assigned_to")
+
+    @field_validator("assignee_ids", mode="before")
+    @classmethod
+    def _validate_assignee_ids(cls, value: Any) -> list[int] | None:
+        if value is None:
+            return None
+        return _validate_positive_int_list(value, "assignee_ids", allow_empty=False)
 
     @field_validator("due_date", mode="before")
     @classmethod
     def _validate_due_date(cls, value: Any) -> str:
         return require_iso_datetime(value, "due_date")
 
+    @model_validator(mode="after")
+    def _validate_any_assignee(self) -> "TaskCreate":
+        if self.assigned_to is None and not self.assignee_ids:
+            raise ValidationError("Необходимо указать исполнителя (assigned_to или assignee_ids)")
+        return self
+
 
 class TaskUpdate(BaseModel):
     status: NormalizedTaskStatus | None = None
     result: str | None = None
     assigned_to: int | None = None
+    assignee_ids: list[int] | None = None
+    due_date: str | None = None
+
+    @field_validator("assigned_to", mode="before")
+    @classmethod
+    def _validate_assigned_to(cls, value: Any) -> int | None:
+        if value is None:
+            return None
+        return require_positive_int(value, "assigned_to")
+
+    @field_validator("assignee_ids", mode="before")
+    @classmethod
+    def _validate_assignee_ids(cls, value: Any) -> list[int] | None:
+        if value is None:
+            return None
+        return _validate_positive_int_list(value, "assignee_ids", allow_empty=True)
+
+    @field_validator("due_date", mode="before")
+    @classmethod
+    def _validate_due_date(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        return require_iso_datetime(value, "due_date")
 
     @model_validator(mode="after")
     def _validate_done_result(self) -> "TaskUpdate":
@@ -56,6 +104,24 @@ class TaskUpdate(BaseModel):
             if self.result is not None and not self.result.strip():
                 raise ValidationError("Для завершения задачи поле 'result' не может быть пустым")
         return self
+
+
+class TaskAssigneesUpdate(BaseModel):
+    assignee_ids: list[int]
+
+    @field_validator("assignee_ids", mode="before")
+    @classmethod
+    def _validate_assignee_ids(cls, value: Any) -> list[int]:
+        return _validate_positive_int_list(value, "assignee_ids", allow_empty=True)
+
+
+class TaskAssigneeAdd(BaseModel):
+    user_id: int
+
+    @field_validator("user_id", mode="before")
+    @classmethod
+    def _validate_user_id(cls, value: Any) -> int:
+        return require_positive_int(value, "user_id")
 
 
 class RknDraftUpdate(BaseModel):
@@ -110,7 +176,7 @@ def create_task(
         container.task_service.create_task,
         user,
         incident_id,
-        payload.model_dump(),
+        payload.model_dump(exclude_unset=True),
     )
 
 
@@ -141,6 +207,48 @@ def update_task(
         user,
         task_id,
         payload.model_dump(exclude_unset=True),
+    )
+
+
+@router.put("/tasks/{task_id}/assignees")
+def set_task_assignees(
+    task_id: int,
+    payload: TaskAssigneesUpdate,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    return call_service(
+        container.task_service.set_assignees,
+        user,
+        task_id,
+        payload.assignee_ids,
+    )
+
+
+@router.post("/tasks/{task_id}/assignees")
+def add_task_assignee(
+    task_id: int,
+    payload: TaskAssigneeAdd,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    return call_service(
+        container.task_service.add_assignee,
+        user,
+        task_id,
+        payload.user_id,
+    )
+
+
+@router.delete("/tasks/{task_id}/assignees/{user_id}")
+def remove_task_assignee(
+    task_id: int,
+    user_id: int,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    return call_service(
+        container.task_service.remove_assignee,
+        user,
+        task_id,
+        user_id,
     )
 
 
