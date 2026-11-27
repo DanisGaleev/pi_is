@@ -100,6 +100,11 @@ CREATE TABLE IF NOT EXISTS audit_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     code TEXT UNIQUE NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS mime_types (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE NOT NULL
+);
 """
 
 ENTITY_TABLES_SQL = """
@@ -222,7 +227,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    assigned_to INTEGER REFERENCES users(id),
     status_id INTEGER NOT NULL REFERENCES task_statuses(id),
     result TEXT NOT NULL DEFAULT '',
     created_by INTEGER REFERENCES users(id),
@@ -231,10 +235,31 @@ CREATE TABLE IF NOT EXISTS tasks (
     due_date TEXT
 );
 
+CREATE TABLE IF NOT EXISTS task_assignees (
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL DEFAULT 0 CHECK (position >= 0 AND position < 3),
+    assigned_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, user_id),
+    UNIQUE (task_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+    filename TEXT NOT NULL,
+    mime_type_id INTEGER NOT NULL REFERENCES mime_types(id),
+    path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
+    uploaded_by INTEGER REFERENCES users(id),
+    uploaded_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     incident_id INTEGER REFERENCES incidents(id) ON DELETE CASCADE,
-    recipient_role_id INTEGER NOT NULL REFERENCES roles(id),
+    recipient_role_id INTEGER REFERENCES roles(id),
     recipient_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     recipient_name TEXT NOT NULL,
     kind_id INTEGER NOT NULL REFERENCES notification_kinds(id),
@@ -261,6 +286,33 @@ CREATE TABLE IF NOT EXISTS ingestion_errors (
     occurred_at TEXT NOT NULL,
     resolved INTEGER NOT NULL DEFAULT 0 CHECK (resolved IN (0, 1))
 );
+
+CREATE TABLE IF NOT EXISTS telegram_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    bot_token TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    webhook_secret TEXT NOT NULL DEFAULT '',
+    app_base_url TEXT NOT NULL DEFAULT '',
+    notify_on_create INTEGER NOT NULL DEFAULT 1 CHECK (notify_on_create IN (0, 1)),
+    notify_on_status INTEGER NOT NULL DEFAULT 1 CHECK (notify_on_status IN (0, 1)),
+    notify_on_escalation INTEGER NOT NULL DEFAULT 1 CHECK (notify_on_escalation IN (0, 1)),
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS telegram_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id TEXT UNIQUE NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    role_id INTEGER REFERENCES roles(id),
+    min_severity_id INTEGER NOT NULL REFERENCES severities(id),
+    notify_on_create INTEGER NOT NULL DEFAULT 1 CHECK (notify_on_create IN (0, 1)),
+    notify_on_status INTEGER NOT NULL DEFAULT 1 CHECK (notify_on_status IN (0, 1)),
+    notify_on_escalation INTEGER NOT NULL DEFAULT 1 CHECK (notify_on_escalation IN (0, 1)),
+    include_pdn INTEGER NOT NULL DEFAULT 0 CHECK (include_pdn IN (0, 1)),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 INDEXES_SQL = """
@@ -276,12 +328,18 @@ CREATE INDEX IF NOT EXISTS idx_incidents_assigned_to ON incidents(assigned_to);
 CREATE INDEX IF NOT EXISTS idx_messages_incident_id ON messages(incident_id);
 CREATE INDEX IF NOT EXISTS idx_history_incident_id ON history(incident_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_incident_id ON tasks(incident_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to ON tasks(assigned_to);
 CREATE INDEX IF NOT EXISTS idx_tasks_status_id ON tasks(status_id);
+CREATE INDEX IF NOT EXISTS idx_task_assignees_user_id ON task_assignees(user_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_incident_id ON attachments(incident_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_task_id ON attachments(task_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_mime_type_id ON attachments(mime_type_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_incident_id ON notifications(incident_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_role_id ON notifications(recipient_role_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_kind_id ON notifications(kind_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_subscriptions_role_id ON telegram_subscriptions(role_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_subscriptions_min_severity_id ON telegram_subscriptions(min_severity_id);
+CREATE INDEX IF NOT EXISTS idx_telegram_subscriptions_active ON telegram_subscriptions(active);
 """
 
 SCHEMA_SQL = f"{LOOKUP_TABLES_SQL}\n{ENTITY_TABLES_SQL}\n{INDEXES_SQL}"
@@ -292,6 +350,13 @@ _DEFAULT_NOTIFICATION_KINDS = (
     "pdn_lawyer_notice",
     "pdn_accounting_notice",
     "warning_broadcast",
+    "tg_incident_created",
+    "tg_incident_status",
+    "tg_test",
+    "tg_escalation_30m",
+    "tg_escalation_director",
+    "tg_pdn_lawyer_notice",
+    "tg_pdn_accounting_notice",
     *(f"urgent_dispatch_{role.value}" for role in Role),
 )
 
@@ -310,18 +375,32 @@ _DEFAULT_HISTORY_ACTIONS = (
     "rkn_draft_updated",
     "rkn_sent",
     "escalation_stopped",
+    "attachment_uploaded",
+    "attachment_linked",
+    "attachment_detached",
+    "attachment_deleted",
 )
 
 _DEFAULT_AUDIT_OBJECT_TYPES = (
     "incident",
     "task",
     "regulator_notice",
+    "attachment",
+    "telegram_config",
+    "telegram_subscription",
 )
 
 _DEFAULT_AUDIT_ACTIONS = (
     "view",
     "create",
     "update",
+    "delete",
+    "upsert",
+    "upload",
+    "download",
+    "link_task",
+    "detach_task",
+    "setup_webhook",
     "status_change",
     "classify",
     "step_updated",
@@ -330,6 +409,34 @@ _DEFAULT_AUDIT_ACTIONS = (
     "access_denied",
     "edit_denied",
     "create_denied",
+    "upload_denied",
+    "delete_denied",
+    "update_denied",
+)
+
+_DEFAULT_MIME_TYPES = (
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "text/plain",
+    "text/markdown",
+    "text/x-markdown",
+    "text/json",
+    "application/json",
+    "text/xml",
+    "application/xml",
+    "text/yaml",
+    "text/x-yaml",
+    "application/yaml",
+    "application/x-yaml",
+    "text/csv",
+    "application/csv",
+    "text/tab-separated-values",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-excel",
+    "application/vnd.oasis.opendocument.spreadsheet",
 )
 
 _CODE_TABLES = frozenset(
@@ -338,6 +445,7 @@ _CODE_TABLES = frozenset(
         "history_actions",
         "audit_object_types",
         "audit_actions",
+        "mime_types",
     }
 )
 
@@ -350,22 +458,28 @@ _LEGACY_TABLES_ORDER = (
     "history",
     "step_progress",
     "tasks",
+    "task_assignees",
+    "attachments",
     "notifications",
     "audit_log",
     "ingestion_errors",
+    "telegram_settings",
+    "telegram_subscriptions",
 )
 
-_EXPECTED_NORMALIZED_COLUMNS: dict[str, str] = {
-    "users": "role_id",
-    "instructions": "incident_type_id",
-    "incidents": "incident_type_id",
-    "messages": "source_id",
-    "history": "action_id",
-    "step_progress": "instruction_step_id",
-    "tasks": "status_id",
-    "notifications": "recipient_role_id",
-    "audit_log": "object_type_id",
-    "ingestion_errors": "source_id",
+_EXPECTED_NORMALIZED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "users": ("role_id",),
+    "instructions": ("incident_type_id", "version"),
+    "incidents": ("incident_type_id", "severity_id", "status_id", "access_category_id"),
+    "messages": ("source_id",),
+    "history": ("action_id",),
+    "step_progress": ("instruction_step_id",),
+    "tasks": ("status_id",),
+    "attachments": ("task_id", "mime_type_id", "size_bytes"),
+    "notifications": ("recipient_role_id", "kind_id", "channel_id", "status_id"),
+    "audit_log": ("object_type_id", "action_id"),
+    "ingestion_errors": ("source_id",),
+    "telegram_subscriptions": ("role_id", "min_severity_id"),
 }
 
 
@@ -405,7 +519,7 @@ def get_or_create_code_id(conn: sqlite3.Connection, table: str, code: str) -> in
 
 
 def seed_lookups(conn: sqlite3.Connection) -> None:
-    """Idempotently populate all enum reference tables and dispatch rule tables."""
+    """Idempotently populate all enum reference tables."""
     conn.executemany(
         "INSERT OR IGNORE INTO roles (code, label) VALUES (?, ?)",
         [(role.value, ROLE_LABELS[role]) for role in Role],
@@ -465,6 +579,10 @@ def seed_lookups(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO audit_actions (code) VALUES (?)",
         [(a,) for a in _DEFAULT_AUDIT_ACTIONS],
     )
+    conn.executemany(
+        "INSERT OR IGNORE INTO mime_types (code) VALUES (?)",
+        [(m,) for m in _DEFAULT_MIME_TYPES],
+    )
 
 
 def seed_dispatch_rules(conn: sqlite3.Connection) -> None:
@@ -498,12 +616,16 @@ def seed_dispatch_rules(conn: sqlite3.Connection) -> None:
 
 def _needs_normalization_migration(conn: sqlite3.Connection) -> bool:
     existing = _existing_tables(conn)
-    for table, required_col in _EXPECTED_NORMALIZED_COLUMNS.items():
-        if table in existing and required_col not in _table_columns(conn, table):
-            return True
+    for table, required_cols in _EXPECTED_NORMALIZED_COLUMNS.items():
+        if table in existing:
+            cols = _table_columns(conn, table)
+            if any(col not in cols for col in required_cols):
+                return True
     if "instructions" in existing and "steps_json" in _table_columns(conn, "instructions"):
         return True
     if "incidents" in existing and "rkn_draft" in _table_columns(conn, "incidents"):
+        return True
+    if "tasks" in existing and "assigned_to" in _table_columns(conn, "tasks"):
         return True
     return False
 
@@ -515,6 +637,13 @@ def _resolve_role_id_for_migration(conn: sqlite3.Connection, raw_role: str) -> i
         (code, code),
     )
     return _lookup_id(conn, "roles", "code", code)
+
+
+def _resolve_optional_role_id_for_migration(conn: sqlite3.Connection, raw_role: str | None) -> int | None:
+    cleaned = str(raw_role or "").strip()
+    if not cleaned or cleaned.lower() == "telegram":
+        return None
+    return _resolve_role_id_for_migration(conn, cleaned)
 
 
 def _resolve_source_id_for_migration(conn: sqlite3.Connection, raw_source: str | None) -> int | None:
@@ -573,7 +702,11 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
     if "users" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_users ORDER BY id").fetchall():
             r = _migrate_row_dict(row)
-            role_id = _resolve_role_id_for_migration(conn, r["role"])
+            role_id = (
+                int(r["role_id"])
+                if "role_id" in r and r["role_id"] is not None
+                else _resolve_role_id_for_migration(conn, r["role"])
+            )
             active = int(r["active"]) if "active" in r and r["active"] is not None else 1
             conn.execute(
                 """
@@ -596,8 +729,11 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
     if "instructions" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_instructions ORDER BY id").fetchall():
             r = _migrate_row_dict(row)
-            inc_type = IncidentType.normalize(r["incident_type"])
-            inc_type_id = _lookup_id(conn, "incident_types", "name", inc_type.value)
+            if "incident_type_id" in r and r["incident_type_id"] is not None:
+                inc_type_id = int(r["incident_type_id"])
+            else:
+                inc_type = IncidentType.normalize(r["incident_type"])
+                inc_type_id = _lookup_id(conn, "incident_types", "name", inc_type.value)
             version = int(r.get("version") or 1)
             conn.execute(
                 "INSERT INTO instructions (id, title, incident_type_id, version) VALUES (?, ?, ?, ?)",
@@ -618,30 +754,64 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
     if "incidents" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_incidents ORDER BY id").fetchall():
             r = _migrate_row_dict(row)
-            inc_type = IncidentType.normalize(r["incident_type"])
-            inc_type_id = _lookup_id(conn, "incident_types", "name", inc_type.value)
-            severity_id: int | None = None
-            raw_sev = str(r.get("severity") or "").strip()
-            if raw_sev:
-                try:
-                    sev = Severity.normalize(raw_sev)
-                    severity_id = _lookup_id(conn, "severities", "code", sev.value)
-                except ValueError:
-                    severity_id = None
-            status_enum = IncidentStatus.resolve(r.get("status")) or IncidentStatus.NEW
-            status_id = _lookup_id(conn, "incident_statuses", "name", status_enum.value)
-            check_result_id, outcome_note = _resolve_outcome_for_migration(conn, r.get("outcome"))
-            computer_id = _get_or_create_entity_id(conn, "computers", "hostname", r.get("computer"))
-            employee_text = str(r.get("employee") or "").strip()
-            employee_id = _get_or_create_entity_id(conn, "employees", "full_name", employee_text)
-            source_id = _resolve_source_id_for_migration(conn, r.get("source"))
+            if "incident_type_id" in r and r["incident_type_id"] is not None:
+                inc_type_id = int(r["incident_type_id"])
+            else:
+                inc_type = IncidentType.normalize(r["incident_type"])
+                inc_type_id = _lookup_id(conn, "incident_types", "name", inc_type.value)
+
+            if "severity_id" in r:
+                severity_id = r["severity_id"]
+            else:
+                severity_id = None
+                raw_sev = str(r.get("severity") or "").strip()
+                if raw_sev:
+                    try:
+                        sev = Severity.normalize(raw_sev)
+                        severity_id = _lookup_id(conn, "severities", "code", sev.value)
+                    except ValueError:
+                        severity_id = None
+
+            if "status_id" in r and r["status_id"] is not None:
+                status_id = int(r["status_id"])
+            else:
+                status_enum = IncidentStatus.resolve(r.get("status")) or IncidentStatus.NEW
+                status_id = _lookup_id(conn, "incident_statuses", "name", status_enum.value)
+
+            if "check_result_id" in r:
+                check_result_id = r["check_result_id"]
+                outcome_note = r.get("outcome_note", "")
+            else:
+                check_result_id, outcome_note = _resolve_outcome_for_migration(conn, r.get("outcome"))
+
+            if "computer_id" in r:
+                computer_id = r["computer_id"]
+            else:
+                computer_id = _get_or_create_entity_id(conn, "computers", "hostname", r.get("computer"))
+
+            if "employee_id" in r:
+                employee_id = r["employee_id"]
+                employee_text = ""
+            else:
+                employee_text = str(r.get("employee") or "").strip()
+                employee_id = _get_or_create_entity_id(conn, "employees", "full_name", employee_text)
+
+            if "source_id" in r:
+                source_id = r["source_id"]
+            else:
+                source_id = _resolve_source_id_for_migration(conn, r.get("source"))
+
             has_pdn = 1 if r.get("has_personal_data") else 0
-            access_category_id = _resolve_access_category_for_migration(
-                conn,
-                r.get("access_category"),
-                has_pdn,
-                employee_text,
-            )
+            if "access_category_id" in r and r["access_category_id"] is not None:
+                access_category_id = int(r["access_category_id"])
+            else:
+                access_category_id = _resolve_access_category_for_migration(
+                    conn,
+                    r.get("access_category"),
+                    has_pdn,
+                    employee_text,
+                )
+
             conn.execute(
                 """
                 INSERT INTO incidents (
@@ -690,7 +860,11 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
     if "messages" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_messages ORDER BY id").fetchall():
             r = _migrate_row_dict(row)
-            source_id = _resolve_source_id_for_migration(conn, r.get("source"))
+            source_id = (
+                r["source_id"]
+                if "source_id" in r
+                else _resolve_source_id_for_migration(conn, r.get("source"))
+            )
             conn.execute(
                 """
                 INSERT INTO messages (id, incident_id, source_id, sender, body, incident_key, received_at)
@@ -710,7 +884,11 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
     if "history" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_history ORDER BY id").fetchall():
             r = _migrate_row_dict(row)
-            action_id = get_or_create_code_id(conn, "history_actions", r["action"])
+            action_id = (
+                int(r["action_id"])
+                if "action_id" in r and r["action_id"] is not None
+                else get_or_create_code_id(conn, "history_actions", r["action"])
+            )
             conn.execute(
                 """
                 INSERT INTO history (id, incident_id, user_id, action_id, details, created_at)
@@ -722,18 +900,21 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
     if "step_progress" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_step_progress").fetchall():
             r = _migrate_row_dict(row)
-            step_row = conn.execute(
-                """
-                SELECT s.id
-                FROM incidents i
-                JOIN instruction_steps s
-                    ON s.instruction_id = i.instruction_id
-                   AND s.step_index = ?
-                WHERE i.id = ?
-                """,
-                (r["step_index"], r["incident_id"]),
-            ).fetchone()
-            step_id = int(step_row["id"]) if step_row is not None else None
+            if "instruction_step_id" in r:
+                step_id = r["instruction_step_id"]
+            else:
+                step_row = conn.execute(
+                    """
+                    SELECT s.id
+                    FROM incidents i
+                    JOIN instruction_steps s
+                        ON s.instruction_id = i.instruction_id
+                       AND s.step_index = ?
+                    WHERE i.id = ?
+                    """,
+                    (r["step_index"], r["incident_id"]),
+                ).fetchone()
+                step_id = int(step_row["id"]) if step_row is not None else None
             conn.execute(
                 """
                 INSERT INTO step_progress (
@@ -753,21 +934,23 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
     if "tasks" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_tasks ORDER BY id").fetchall():
             r = _migrate_row_dict(row)
-            task_status = TaskStatus.resolve(r.get("status")) or TaskStatus.OPEN
-            status_id = _lookup_id(conn, "task_statuses", "name", task_status.value)
+            if "status_id" in r and r["status_id"] is not None:
+                status_id = int(r["status_id"])
+            else:
+                task_status = TaskStatus.resolve(r.get("status")) or TaskStatus.OPEN
+                status_id = _lookup_id(conn, "task_statuses", "name", task_status.value)
             conn.execute(
                 """
                 INSERT INTO tasks (
-                    id, incident_id, title, description, assigned_to,
+                    id, incident_id, title, description,
                     status_id, result, created_by, created_at, completed_at, due_date
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     r["id"],
                     r["incident_id"],
                     r["title"],
                     r.get("description", ""),
-                    r.get("assigned_to"),
                     status_id,
                     r.get("result", ""),
                     r.get("created_by"),
@@ -777,24 +960,100 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
                 ),
             )
 
+    if "task_assignees" in migrated_legacy:
+        positions_by_task: dict[int, int] = {}
+        for row in conn.execute(
+            "SELECT * FROM _legacy_task_assignees ORDER BY task_id ASC, position ASC, user_id ASC"
+        ).fetchall():
+            r = _migrate_row_dict(row)
+            tid = int(r["task_id"])
+            pos = positions_by_task.get(tid, 0)
+            if pos >= 3:
+                continue
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO task_assignees (task_id, user_id, position, assigned_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (tid, int(r["user_id"]), pos, r["assigned_at"]),
+            )
+            positions_by_task[tid] = pos + 1
+
+    if "tasks" in migrated_legacy:
+        legacy_task_cols = _table_columns(conn, "_legacy_tasks")
+        if "assigned_to" in legacy_task_cols:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO task_assignees (task_id, user_id, position, assigned_at)
+                SELECT lt.id, lt.assigned_to, 0, lt.created_at
+                FROM _legacy_tasks lt
+                WHERE lt.assigned_to IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM task_assignees ta WHERE ta.task_id = lt.id
+                  )
+                """
+            )
+
+    if "attachments" in migrated_legacy:
+        for row in conn.execute("SELECT * FROM _legacy_attachments ORDER BY id").fetchall():
+            r = _migrate_row_dict(row)
+            mime_type_id = (
+                int(r["mime_type_id"])
+                if "mime_type_id" in r and r["mime_type_id"] is not None
+                else get_or_create_code_id(conn, "mime_types", r.get("mime_type") or "application/octet-stream")
+            )
+            size_bytes = int(r["size_bytes"]) if "size_bytes" in r and r["size_bytes"] is not None else 0
+            conn.execute(
+                """
+                INSERT INTO attachments (
+                    id, incident_id, task_id, filename, mime_type_id, path,
+                    size_bytes, uploaded_by, uploaded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    r["id"],
+                    r["incident_id"],
+                    r.get("task_id"),
+                    r["filename"],
+                    mime_type_id,
+                    r["path"],
+                    max(0, size_bytes),
+                    r.get("uploaded_by"),
+                    r["uploaded_at"],
+                ),
+            )
+
     if "notifications" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_notifications ORDER BY id").fetchall():
             r = _migrate_row_dict(row)
-            role_id = _resolve_role_id_for_migration(conn, r["recipient_role"])
-            kind_id = get_or_create_code_id(conn, "notification_kinds", r["kind"])
-            raw_channel = str(r.get("channel") or Channel.INTERNAL.value).strip().lower()
-            try:
-                ch_val = Channel(raw_channel).value
-            except ValueError:
-                ch_val = Channel.INTERNAL.value
-            channel_id = _lookup_id(conn, "notification_channels", "name", ch_val)
+            if "recipient_role_id" in r:
+                role_id = r["recipient_role_id"]
+            else:
+                role_id = _resolve_optional_role_id_for_migration(conn, r.get("recipient_role"))
+            kind_id = (
+                int(r["kind_id"])
+                if "kind_id" in r and r["kind_id"] is not None
+                else get_or_create_code_id(conn, "notification_kinds", r["kind"])
+            )
+            if "channel_id" in r and r["channel_id"] is not None:
+                channel_id = int(r["channel_id"])
+            else:
+                raw_channel = str(r.get("channel") or Channel.INTERNAL.value).strip().lower()
+                try:
+                    ch_val = Channel(raw_channel).value
+                except ValueError:
+                    ch_val = Channel.INTERNAL.value
+                channel_id = _lookup_id(conn, "notification_channels", "name", ch_val)
 
-            raw_status = str(r.get("status") or DeliveryStatus.SENT.value).strip().lower()
-            try:
-                st_val = DeliveryStatus(raw_status).value
-            except ValueError:
-                st_val = DeliveryStatus.SENT.value
-            status_id = _lookup_id(conn, "delivery_statuses", "name", st_val)
+            if "status_id" in r and r["status_id"] is not None:
+                status_id = int(r["status_id"])
+            else:
+                raw_status = str(r.get("status") or DeliveryStatus.SENT.value).strip().lower()
+                try:
+                    st_val = DeliveryStatus(raw_status).value
+                except ValueError:
+                    st_val = DeliveryStatus.SENT.value
+                status_id = _lookup_id(conn, "delivery_statuses", "name", st_val)
 
             conn.execute(
                 """
@@ -807,7 +1066,7 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
                     r["id"],
                     r.get("incident_id"),
                     role_id,
-                    None,
+                    r.get("recipient_user_id"),
                     r["recipient_name"],
                     kind_id,
                     r["message"],
@@ -820,8 +1079,16 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
     if "audit_log" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_audit_log ORDER BY id").fetchall():
             r = _migrate_row_dict(row)
-            obj_type_id = get_or_create_code_id(conn, "audit_object_types", r["object_type"])
-            action_id = get_or_create_code_id(conn, "audit_actions", r["action"])
+            obj_type_id = (
+                int(r["object_type_id"])
+                if "object_type_id" in r and r["object_type_id"] is not None
+                else get_or_create_code_id(conn, "audit_object_types", r["object_type"])
+            )
+            action_id = (
+                int(r["action_id"])
+                if "action_id" in r and r["action_id"] is not None
+                else get_or_create_code_id(conn, "audit_actions", r["action"])
+            )
             conn.execute(
                 """
                 INSERT INTO audit_log (id, user_id, object_type_id, object_id, action_id, created_at)
@@ -833,13 +1100,17 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
     if "ingestion_errors" in migrated_legacy:
         for row in conn.execute("SELECT * FROM _legacy_ingestion_errors ORDER BY id").fetchall():
             r = _migrate_row_dict(row)
-            raw_src = str(r.get("source") or "").strip()
-            src_row = conn.execute(
-                "SELECT id FROM sources WHERE name = ? OR code = ?",
-                (raw_src, raw_src.upper()),
-            ).fetchone()
-            source_id = int(src_row["id"]) if src_row is not None else None
-            raw_source_val = "" if source_id is not None else raw_src
+            if "source_id" in r:
+                source_id = r["source_id"]
+                raw_source_val = r.get("raw_source", "")
+            else:
+                raw_src = str(r.get("source") or "").strip()
+                src_row = conn.execute(
+                    "SELECT id FROM sources WHERE name = ? OR code = ?",
+                    (raw_src, raw_src.upper()),
+                ).fetchone()
+                source_id = int(src_row["id"]) if src_row is not None else None
+                raw_source_val = "" if source_id is not None else raw_src
             conn.execute(
                 """
                 INSERT INTO ingestion_errors (id, source_id, raw_source, error_text, occurred_at, resolved)
@@ -852,6 +1123,71 @@ def _copy_legacy_data(conn: sqlite3.Connection, migrated_legacy: set[str]) -> No
                     r["error_text"],
                     r["occurred_at"],
                     1 if r.get("resolved") else 0,
+                ),
+            )
+
+    if "telegram_settings" in migrated_legacy:
+        for row in conn.execute("SELECT * FROM _legacy_telegram_settings").fetchall():
+            r = _migrate_row_dict(row)
+            conn.execute(
+                """
+                INSERT INTO telegram_settings (
+                    id, bot_token, enabled, webhook_secret, app_base_url,
+                    notify_on_create, notify_on_status, notify_on_escalation, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    r["id"],
+                    r.get("bot_token", ""),
+                    1 if r.get("enabled", 1) else 0,
+                    r.get("webhook_secret", ""),
+                    r.get("app_base_url", ""),
+                    1 if r.get("notify_on_create", 1) else 0,
+                    1 if r.get("notify_on_status", 1) else 0,
+                    1 if r.get("notify_on_escalation", 1) else 0,
+                    r.get("updated_at", ""),
+                ),
+            )
+
+    if "telegram_subscriptions" in migrated_legacy:
+        for row in conn.execute("SELECT * FROM _legacy_telegram_subscriptions ORDER BY id").fetchall():
+            r = _migrate_row_dict(row)
+            if "role_id" in r:
+                role_id = r["role_id"]
+            else:
+                role_id = _resolve_optional_role_id_for_migration(conn, r.get("role"))
+
+            if "min_severity_id" in r and r["min_severity_id"] is not None:
+                min_sev_id = int(r["min_severity_id"])
+            else:
+                raw_sev = str(r.get("min_severity") or Severity.LOW.value).strip()
+                try:
+                    sev = Severity.normalize(raw_sev)
+                except ValueError:
+                    sev = Severity.LOW
+                min_sev_id = _lookup_id(conn, "severities", "code", sev.value)
+
+            conn.execute(
+                """
+                INSERT INTO telegram_subscriptions (
+                    id, chat_id, label, role_id, min_severity_id,
+                    notify_on_create, notify_on_status, notify_on_escalation,
+                    include_pdn, active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    r["id"],
+                    r["chat_id"],
+                    r.get("label", ""),
+                    role_id,
+                    min_sev_id,
+                    1 if r.get("notify_on_create", 1) else 0,
+                    1 if r.get("notify_on_status", 1) else 0,
+                    1 if r.get("notify_on_escalation", 1) else 0,
+                    1 if r.get("include_pdn", 0) else 0,
+                    1 if r.get("active", 1) else 0,
+                    r["created_at"],
+                    r["updated_at"],
                 ),
             )
 

@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -234,6 +235,23 @@ class InstructionProgress:
         }
 
 
+MAX_TASK_ASSIGNEES = 3
+
+
+def _normalize_assignee_ids(user_ids: Iterable[int]) -> list[int]:
+    """Deduplicate task assignee IDs preserving order and validate limit."""
+    unique: list[int] = []
+    seen: set[int] = set()
+    for uid in user_ids:
+        uid_int = int(uid)
+        if uid_int not in seen:
+            seen.add(uid_int)
+            unique.append(uid_int)
+    if len(unique) > MAX_TASK_ASSIGNEES:
+        raise ValueError(f"На задачу можно назначить не более {MAX_TASK_ASSIGNEES} исполнителей")
+    return unique
+
+
 @dataclass
 class Task:
     """Remediation or investigation task assigned under an incident."""
@@ -249,6 +267,44 @@ class Task:
     created_at: str
     completed_at: str | None = None
     due_date: str | None = None
+    assignee_ids: list[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.assignee_ids:
+            self.assignee_ids = _normalize_assignee_ids(self.assignee_ids)
+            self.assigned_to = self.assignee_ids[0]
+        elif self.assigned_to is not None:
+            self.assigned_to = int(self.assigned_to)
+            self.assignee_ids = [self.assigned_to]
+        else:
+            self.assignee_ids = []
+
+    def set_assignees(self, user_ids: Iterable[int]) -> None:
+        """Replace task assignees (up to MAX_TASK_ASSIGNEES) and sync primary assigned_to."""
+        self.assignee_ids = _normalize_assignee_ids(user_ids)
+        self.assigned_to = self.assignee_ids[0] if self.assignee_ids else None
+
+    def add_assignee(self, user_id: int) -> bool:
+        """Add an assignee if absent and below MAX_TASK_ASSIGNEES; return True if added."""
+        uid = int(user_id)
+        if uid in self.assignee_ids:
+            return False
+        if len(self.assignee_ids) >= MAX_TASK_ASSIGNEES:
+            raise ValueError(
+                f"На задачу можно назначить не более {MAX_TASK_ASSIGNEES} исполнителей"
+            )
+        self.assignee_ids = [*self.assignee_ids, uid]
+        self.assigned_to = self.assignee_ids[0]
+        return True
+
+    def remove_assignee(self, user_id: int) -> bool:
+        """Remove an assignee if present and sync primary assigned_to; return True if removed."""
+        uid = int(user_id)
+        if uid not in self.assignee_ids:
+            return False
+        self.assignee_ids = [existing for existing in self.assignee_ids if existing != uid]
+        self.assigned_to = self.assignee_ids[0] if self.assignee_ids else None
+        return True
 
     def complete(self, result: str, completed_at: str) -> None:
         """Mark the task as completed with an outcome summary."""
@@ -275,6 +331,7 @@ class Task:
             "title": self.title,
             "description": self.description,
             "assigned_to": self.assigned_to,
+            "assignee_ids": list(self.assignee_ids),
             "status": self.status,
             "result": self.result,
             "created_by": self.created_by,
@@ -313,7 +370,7 @@ class FollowUpMeasure:
 
 @dataclass
 class Attachment:
-    """Evidence or document file attached to an incident."""
+    """Evidence or document file attached to an incident and optionally a task."""
 
     id: int
     incident_id: int
@@ -322,15 +379,19 @@ class Attachment:
     path: str
     uploaded_by: int | None
     uploaded_at: str
+    task_id: int | None = None
+    size_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize attachment metadata to a plain dictionary."""
         return {
             "id": self.id,
             "incident_id": self.incident_id,
+            "task_id": self.task_id,
             "filename": self.filename,
             "mime_type": self.mime_type,
             "path": self.path,
+            "size_bytes": self.size_bytes,
             "uploaded_by": self.uploaded_by,
             "uploaded_at": self.uploaded_at,
         }
@@ -621,4 +682,95 @@ class ReportFile:
             "format": self.format,
             "created_at": self.created_at,
             "data": dict(self.data),
+        }
+
+
+def _mask_secret(value: str) -> str:
+    """Return a safe masked representation of a secret token."""
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= 10:
+        return "***"
+    return f"{cleaned[:6]}...{cleaned[-4:]}"
+
+
+@dataclass
+class TelegramSettings:
+    """Runtime configuration for Telegram bot incident notifications."""
+
+    id: int = 1
+    bot_token: str = ""
+    enabled: bool = True
+    webhook_secret: str = ""
+    app_base_url: str = ""
+    notify_on_create: bool = True
+    notify_on_status: bool = True
+    notify_on_escalation: bool = True
+    updated_at: str = ""
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.notify_on_create = bool(self.notify_on_create)
+        self.notify_on_status = bool(self.notify_on_status)
+        self.notify_on_escalation = bool(self.notify_on_escalation)
+
+    def to_dict(self, *, mask_secrets: bool = True) -> dict[str, Any]:
+        """Serialize Telegram settings safely, masking tokens by default."""
+        return {
+            "id": self.id,
+            "enabled": self.enabled,
+            "has_token": bool(self.bot_token.strip()),
+            "bot_token": _mask_secret(self.bot_token) if mask_secrets else self.bot_token,
+            "has_webhook_secret": bool(self.webhook_secret.strip()),
+            "webhook_secret": (
+                _mask_secret(self.webhook_secret) if mask_secrets else self.webhook_secret
+            ),
+            "app_base_url": self.app_base_url,
+            "notify_on_create": self.notify_on_create,
+            "notify_on_status": self.notify_on_status,
+            "notify_on_escalation": self.notify_on_escalation,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass
+class TelegramSubscription:
+    """Telegram chat subscription with role-based and severity filters."""
+
+    id: int
+    chat_id: str
+    label: str = ""
+    role: str = ""
+    min_severity: str = Severity.LOW.value
+    notify_on_create: bool = True
+    notify_on_status: bool = True
+    notify_on_escalation: bool = True
+    include_pdn: bool = False
+    active: bool = True
+    created_at: str = ""
+    updated_at: str = ""
+
+    def __post_init__(self) -> None:
+        self.notify_on_create = bool(self.notify_on_create)
+        self.notify_on_status = bool(self.notify_on_status)
+        self.notify_on_escalation = bool(self.notify_on_escalation)
+        self.include_pdn = bool(self.include_pdn)
+        self.active = bool(self.active)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize subscription fields to a plain dictionary."""
+        return {
+            "id": self.id,
+            "chat_id": self.chat_id,
+            "label": self.label,
+            "role": self.role,
+            "min_severity": self.min_severity,
+            "notify_on_create": self.notify_on_create,
+            "notify_on_status": self.notify_on_status,
+            "notify_on_escalation": self.notify_on_escalation,
+            "include_pdn": self.include_pdn,
+            "active": self.active,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
         }

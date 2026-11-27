@@ -176,6 +176,27 @@ class TestDomainModels(unittest.TestCase):
         self.assertEqual(overdue_task.completed_at, "2026-11-20T12:05:00+00:00")
         self.assertFalse(overdue_task.is_overdue(now))
         self.assertEqual(overdue_task.to_dict()["result"], "Угроза удалена")
+        self.assertEqual(overdue_task.assignee_ids, [2])
+
+        # Multi-assignee domain helpers (max 3, deduplication, primary sync)
+        self.assertTrue(overdue_task.add_assignee(3))
+        self.assertFalse(overdue_task.add_assignee(3))  # idempotent
+        self.assertTrue(overdue_task.add_assignee(4))
+        self.assertEqual(overdue_task.assignee_ids, [2, 3, 4])
+        self.assertEqual(overdue_task.assigned_to, 2)
+        with self.assertRaises(ValueError):
+            overdue_task.add_assignee(5)
+
+        self.assertTrue(overdue_task.remove_assignee(2))
+        self.assertEqual(overdue_task.assignee_ids, [3, 4])
+        self.assertEqual(overdue_task.assigned_to, 3)
+        self.assertFalse(overdue_task.remove_assignee(999))
+
+        overdue_task.set_assignees([5, 5, 6])
+        self.assertEqual(overdue_task.assignee_ids, [5, 6])
+        self.assertEqual(overdue_task.assigned_to, 5)
+        with self.assertRaises(ValueError):
+            overdue_task.set_assignees([1, 2, 3, 4])
 
     def test_regulator_notice_build_draft_and_mark_sent(self) -> None:
         inc = Incident(
@@ -615,16 +636,26 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
                     "history_actions",
                     "audit_object_types",
                     "audit_actions",
+                    "mime_types",
                     "computers",
                     "employees",
                     "instruction_steps",
                     "dispatch_rules",
                     "dispatch_rule_urgent_roles",
                     "regulator_notices",
+                    "task_assignees",
+                    "attachments",
+                    "telegram_settings",
+                    "telegram_subscriptions",
                     "audit_log",
                     "ingestion_errors",
                 }
                 self.assertTrue(expected_tables.issubset(tables))
+
+                backfilled = migrated.execute(
+                    "SELECT task_id, user_id, position FROM task_assignees WHERE task_id = 1"
+                ).fetchall()
+                self.assertEqual([(r["task_id"], r["user_id"], r["position"]) for r in backfilled], [(1, 1, 0)])
 
                 def cols(table: str) -> set[str]:
                     return {r["name"] for r in migrated.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -632,7 +663,11 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
                 self.assertTrue({"role_id", "active"}.issubset(cols("users")))
                 self.assertNotIn("role", cols("users"))
                 self.assertTrue({"status_id", "due_date"}.issubset(cols("tasks")))
-                self.assertNotIn("status", cols("tasks"))
+                self.assertFalse({"status", "assigned_to"}.intersection(cols("tasks")))
+                self.assertTrue({"task_id", "size_bytes", "mime_type_id"}.issubset(cols("attachments")))
+                self.assertNotIn("mime_type", cols("attachments"))
+                self.assertTrue({"role_id", "min_severity_id"}.issubset(cols("telegram_subscriptions")))
+                self.assertFalse({"role", "min_severity"}.intersection(cols("telegram_subscriptions")))
                 self.assertTrue(
                     {"incident_type_id", "severity_id", "status_id", "access_category_id", "assigned_to"}.issubset(
                         cols("incidents")
@@ -656,6 +691,7 @@ class TestLegacyDatabaseMigration(unittest.TestCase):
             tasks = container.task_repo.list_by_incident(1)
             self.assertEqual(len(tasks), 1)
             self.assertIsNone(tasks[0].due_date)
+            self.assertEqual(tasks[0].assignee_ids, [1])
 
             notifs = container.notification_repo.list_all()
             self.assertEqual(len(notifs), 1)

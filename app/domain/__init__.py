@@ -1,4 +1,5 @@
 from app.domain.models import (
+    MAX_TASK_ASSIGNEES,
     Attachment,
     AuditRecord,
     Computer,
@@ -17,10 +18,13 @@ from app.domain.models import (
     ReportFile,
     Site,
     Task,
+    TelegramSettings,
+    TelegramSubscription,
     User,
 )
 
 __all__ = [
+    "MAX_TASK_ASSIGNEES",
     "Attachment",
     "AuditRecord",
     "Computer",
@@ -39,5 +43,7 @@ __all__ = [
     "ReportFile",
     "Site",
     "Task",
+    "TelegramSettings",
+    "TelegramSubscription",
     "User",
 ]

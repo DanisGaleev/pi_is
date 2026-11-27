@@ -1,4 +1,8 @@
 import hmac
+import json
+import os
+import urllib.error
+import urllib.request
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
@@ -136,12 +140,88 @@ class MailAdapter(SourceAdapter):
 
 
 class TelegramAdapter(SourceAdapter):
-    """Adapter for Telegram bot incident reports and outbound replies."""
+    """Adapter for Telegram bot incident reports and Bot API outbound delivery."""
 
     source_type: SourceType = SourceType.TELEGRAM
+    MAX_MESSAGE_LENGTH: int = 4000
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        bot_token: str | None = None,
+        *,
+        api_base: str = "https://api.telegram.org",
+        timeout: float = 5.0,
+        transport: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
         self.sent_messages: list[dict[str, str]] = []
+        self.bot_token: str = (bot_token or "").strip()
+        self.api_base: str = api_base.rstrip("/")
+        self.timeout: float = timeout
+        self._transport = transport
+        self.last_error: str | None = None
+
+    def _resolve_token(self, bot_token: str | None = None) -> str:
+        if bot_token is not None:
+            return bot_token.strip()
+        if self.bot_token:
+            return self.bot_token
+        return os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+
+    def call_api(
+        self,
+        method: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        bot_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Invoke a Telegram Bot API method via injectable transport or urllib."""
+        body_dict = dict(payload or {})
+        if self._transport is not None:
+            try:
+                res = self._transport(method, body_dict)
+                self.last_error = None if res.get("ok") else str(res.get("description") or "Telegram API error")
+                return res
+            except Exception as exc:
+                self.last_error = str(exc)
+                return {"ok": False, "description": self.last_error}
+
+        token = self._resolve_token(bot_token)
+        if not token:
+            self.last_error = "Telegram bot token is not configured"
+            return {"ok": False, "description": self.last_error}
+
+        url = f"{self.api_base}/bot{token}/{method}"
+        data = json.dumps(body_dict, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                raw_resp = resp.read().decode("utf-8")
+            parsed = json.loads(raw_resp) if raw_resp else {"ok": False, "description": "Empty response"}
+            if not isinstance(parsed, dict):
+                self.last_error = "Invalid Telegram API response"
+                return {"ok": False, "description": self.last_error}
+            self.last_error = (
+                None if parsed.get("ok") else str(parsed.get("description") or "Telegram API error")
+            )
+            return parsed
+        except urllib.error.HTTPError as exc:
+            err_body = ""
+            try:
+                err_body = exc.read().decode("utf-8", errors="replace")
+                parsed_err = json.loads(err_body)
+                desc = str(parsed_err.get("description") or err_body)
+            except Exception:
+                desc = err_body or str(exc)
+            self.last_error = f"HTTP {exc.code}: {desc}"
+            return {"ok": False, "error_code": exc.code, "description": self.last_error}
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            self.last_error = str(exc)
+            return {"ok": False, "description": self.last_error}
 
     def normalize(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Normalize an incoming Telegram message payload."""
@@ -155,20 +235,91 @@ class TelegramAdapter(SourceAdapter):
             key_keys=("incident_key", "update_id", "message_id"),
         )
 
-    def send_message(self, user: str, text: str) -> bool:
-        """Record an outbound Telegram message to a user or chat."""
+    def send_message(
+        self,
+        user: str,
+        text: str,
+        *,
+        bot_token: str | None = None,
+        parse_mode: str | None = None,
+    ) -> bool:
+        """Deliver an outbound Telegram message via Bot API or in-memory fallback."""
         target = str(user).strip()
         body = str(text).strip()
         if not target or not body:
             return False
-        self.sent_messages.append({"user": target, "text": body})
-        return True
+        if len(body) > self.MAX_MESSAGE_LENGTH:
+            body = body[: self.MAX_MESSAGE_LENGTH - 3] + "..."
 
-    def reply_number(self, chat_id: str, incident_id: int) -> bool:
+        token = self._resolve_token(bot_token)
+        if not token and self._transport is None:
+            self.last_error = None
+            self.sent_messages.append({"user": target, "text": body})
+            return True
+
+        payload: dict[str, Any] = {
+            "chat_id": target,
+            "text": body,
+            "disable_web_page_preview": True,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+
+        res = self.call_api("sendMessage", payload, bot_token=token)
+        if res.get("ok"):
+            self.sent_messages.append({"user": target, "text": body})
+            return True
+        return False
+
+    def get_me(self, *, bot_token: str | None = None) -> dict[str, Any]:
+        """Fetch bot profile info via Telegram getMe."""
+        return self.call_api("getMe", {}, bot_token=bot_token)
+
+    def get_updates(
+        self,
+        *,
+        offset: int | None = None,
+        limit: int = 20,
+        bot_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch recent incoming updates via Telegram getUpdates."""
+        payload: dict[str, Any] = {"limit": limit, "timeout": 0}
+        if offset is not None:
+            payload["offset"] = offset
+        return self.call_api("getUpdates", payload, bot_token=bot_token)
+
+    def set_webhook(
+        self,
+        url: str,
+        *,
+        secret_token: str = "",
+        bot_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Configure Telegram Bot API webhook URL and optional secret header."""
+        payload: dict[str, Any] = {"url": url.strip()}
+        if secret_token.strip():
+            payload["secret_token"] = secret_token.strip()
+        return self.call_api("setWebhook", payload, bot_token=bot_token)
+
+    def delete_webhook(self, *, bot_token: str | None = None) -> dict[str, Any]:
+        """Remove configured Telegram webhook."""
+        return self.call_api("deleteWebhook", {}, bot_token=bot_token)
+
+    def reply_number(
+        self,
+        chat_id: str,
+        incident_id: int,
+        *,
+        bot_token: str | None = None,
+    ) -> bool:
         """Send an incident registration number confirmation to a Telegram chat."""
         if incident_id is None or int(incident_id) <= 0:
             return False
-        return self.send_message(str(chat_id), f"Инцидент #{incident_id} зарегистрирован")
+        return self.send_message(
+            str(chat_id),
+            f"Инцидент #{incident_id} зарегистрирован",
+            bot_token=bot_token,
+        )
 
 
 ADAPTER_REGISTRY: dict[SourceType, SourceAdapter] = {

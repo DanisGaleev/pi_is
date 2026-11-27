@@ -1,5 +1,4 @@
 import hashlib
-import json
 import os
 import re
 import sqlite3
@@ -9,6 +8,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from app.domain.models import (
+    MAX_TASK_ASSIGNEES,
+    Attachment,
     AuditRecord,
     HistoryRecord,
     Incident,
@@ -18,6 +19,8 @@ from app.domain.models import (
     InstructionProgress,
     Notification,
     Task,
+    TelegramSettings,
+    TelegramSubscription,
     User,
 )
 from app.enums import (
@@ -102,6 +105,15 @@ def _lookup_id(conn: sqlite3.Connection, table: str, column: str, value: str) ->
 def _resolve_role_id(conn: sqlite3.Connection, role: Role | str) -> int:
     role_val = role.value if isinstance(role, Role) else str(role).strip()
     return _lookup_id(conn, "roles", "code", role_val)
+
+
+def _resolve_optional_role_id(conn: sqlite3.Connection, role: Role | str | None) -> int | None:
+    if isinstance(role, Role):
+        return _lookup_id(conn, "roles", "code", role.value)
+    cleaned = str(role or "").strip()
+    if not cleaned or cleaned.lower() == "telegram":
+        return None
+    return _lookup_id(conn, "roles", "code", cleaned)
 
 
 def _resolve_incident_type_id(conn: sqlite3.Connection, incident_type: IncidentType | str) -> int:
@@ -523,20 +535,38 @@ def _row_to_incident(row: sqlite3.Row) -> Incident:
     )
 
 
-def _row_to_task(row: sqlite3.Row) -> Task:
+def _row_to_task(row: sqlite3.Row, assignee_ids: Iterable[int] | None = None) -> Task:
     keys = row.keys()
+    ids = list(assignee_ids) if assignee_ids is not None else []
+    primary_assigned = ids[0] if ids else (row["assigned_to"] if "assigned_to" in keys else None)
     return Task(
         id=row["id"],
         incident_id=row["incident_id"],
         title=row["title"],
         description=row["description"],
-        assigned_to=row["assigned_to"],
+        assigned_to=primary_assigned,
         status=row["status"],
         result=row["result"],
         created_by=row["created_by"],
         created_at=row["created_at"],
         completed_at=row["completed_at"],
         due_date=row["due_date"] if "due_date" in keys else None,
+        assignee_ids=ids,
+    )
+
+
+def _row_to_attachment(row: sqlite3.Row) -> Attachment:
+    keys = row.keys()
+    return Attachment(
+        id=row["id"],
+        incident_id=row["incident_id"],
+        filename=row["filename"],
+        mime_type=row["mime_type"],
+        path=row["path"],
+        uploaded_by=row["uploaded_by"],
+        uploaded_at=row["uploaded_at"],
+        task_id=row["task_id"] if "task_id" in keys else None,
+        size_bytes=int(row["size_bytes"]) if "size_bytes" in keys and row["size_bytes"] is not None else 0,
     )
 
 
@@ -713,7 +743,7 @@ class SessionRepository(_BaseRepository):
         """Resolve an active user from a bearer session token."""
         with self.db.connection() as conn:
             row = conn.execute(
-                f"""
+                """
                 SELECT u.id, u.username, u.full_name, r.code AS role, u.active
                 FROM sessions s
                 JOIN users u ON u.id = s.user_id
@@ -1348,7 +1378,7 @@ class InstructionRepository(_BaseRepository):
 
 
 _TASK_SELECT_SQL = """
-    SELECT t.id, t.incident_id, t.title, t.description, t.assigned_to,
+    SELECT t.id, t.incident_id, t.title, t.description,
            ts.name AS status, t.result, t.created_by, t.created_at,
            t.completed_at, t.due_date
     FROM tasks t
@@ -1357,23 +1387,93 @@ _TASK_SELECT_SQL = """
 
 
 class TaskRepository(_BaseRepository):
-    """Persistence operations for incident tasks."""
+    """Persistence operations for incident tasks and their multi-assignee links."""
+
+    @staticmethod
+    def _load_assignees_map(
+        conn: sqlite3.Connection,
+        task_ids: Iterable[int],
+    ) -> dict[int, list[int]]:
+        unique_ids = sorted({int(tid) for tid in task_ids})
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        rows = conn.execute(
+            f"""
+            SELECT task_id, user_id
+            FROM task_assignees
+            WHERE task_id IN ({placeholders})
+            ORDER BY task_id ASC, position ASC, user_id ASC
+            """,
+            unique_ids,
+        ).fetchall()
+        mapping: dict[int, list[int]] = {}
+        for row in rows:
+            mapping.setdefault(int(row["task_id"]), []).append(int(row["user_id"]))
+        return mapping
+
+    @staticmethod
+    def _sync_assignees(
+        conn: sqlite3.Connection,
+        task_id: int,
+        assignee_ids: Iterable[int],
+        assigned_at: str,
+    ) -> None:
+        conn.execute("DELETE FROM task_assignees WHERE task_id = ?", (task_id,))
+        entries = [
+            (task_id, int(user_id), pos, assigned_at)
+            for pos, user_id in enumerate(assignee_ids)
+        ]
+        if entries:
+            conn.executemany(
+                """
+                INSERT INTO task_assignees (task_id, user_id, position, assigned_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                entries,
+            )
+
+    @staticmethod
+    def _resolve_assignee_ids(
+        assigned_to: int | None,
+        assignee_ids: Iterable[int] | None,
+    ) -> list[int]:
+        raw = (
+            list(assignee_ids)
+            if assignee_ids is not None
+            else ([assigned_to] if assigned_to is not None else [])
+        )
+        unique: list[int] = []
+        seen: set[int] = set()
+        for uid in raw:
+            uid_int = int(uid)
+            if uid_int not in seen:
+                seen.add(uid_int)
+                unique.append(uid_int)
+        if len(unique) > MAX_TASK_ASSIGNEES:
+            raise ValueError(
+                f"На задачу можно назначить не более {MAX_TASK_ASSIGNEES} исполнителей"
+            )
+        return unique
 
     def get_by_id(self, task_id: int) -> Task | None:
-        """Fetch a task by ID."""
+        """Fetch a task by ID along with its ordered assignee IDs."""
         with self.db.connection() as conn:
             row = conn.execute(
                 f"{_TASK_SELECT_SQL} WHERE t.id = ?",
                 (task_id,),
             ).fetchone()
-            return _row_to_task(row) if row is not None else None
+            if row is None:
+                return None
+            assignees_map = self._load_assignees_map(conn, [task_id])
+            return _row_to_task(row, assignees_map.get(task_id))
 
     def get_with_incident_pdn(self, task_id: int) -> tuple[Task, int] | None:
-        """Fetch a task together with its parent incident's has_personal_data flag."""
+        """Fetch a task together with its assignees and parent incident's has_personal_data flag."""
         with self.db.connection() as conn:
             row = conn.execute(
                 """
-                SELECT t.id, t.incident_id, t.title, t.description, t.assigned_to,
+                SELECT t.id, t.incident_id, t.title, t.description,
                        ts.name AS status, t.result, t.created_by, t.created_at,
                        t.completed_at, t.due_date, i.has_personal_data
                 FROM tasks t
@@ -1385,7 +1485,8 @@ class TaskRepository(_BaseRepository):
             ).fetchone()
             if row is None:
                 return None
-            return _row_to_task(row), int(row["has_personal_data"])
+            assignees_map = self._load_assignees_map(conn, [task_id])
+            return _row_to_task(row, assignees_map.get(task_id)), int(row["has_personal_data"])
 
     def list_by_incident(self, incident_id: int) -> list[Task]:
         """List tasks attached to an incident ordered by creation."""
@@ -1394,7 +1495,8 @@ class TaskRepository(_BaseRepository):
                 f"{_TASK_SELECT_SQL} WHERE t.incident_id = ? ORDER BY t.id ASC",
                 (incident_id,),
             ).fetchall()
-            return [_row_to_task(r) for r in rows]
+            assignees_map = self._load_assignees_map(conn, [r["id"] for r in rows])
+            return [_row_to_task(r, assignees_map.get(r["id"])) for r in rows]
 
     def _query_filtered_rows(
         self,
@@ -1402,14 +1504,19 @@ class TaskRepository(_BaseRepository):
         status: str | None = None,
         incident_id: int | None = None,
         exclude_personal_data: bool = False,
-    ) -> list[sqlite3.Row]:
+    ) -> tuple[list[sqlite3.Row], dict[int, list[int]]]:
         clauses: list[str] = []
         params: list[Any] = []
 
         if exclude_personal_data:
             clauses.append("i.has_personal_data = 0")
         if assigned_to is not None:
-            clauses.append("t.assigned_to = ?")
+            clauses.append(
+                """EXISTS (
+                    SELECT 1 FROM task_assignees ta
+                    WHERE ta.task_id = t.id AND ta.user_id = ?
+                )"""
+            )
             params.append(assigned_to)
         if status:
             resolved_status = TaskStatus.resolve(status)
@@ -1421,7 +1528,7 @@ class TaskRepository(_BaseRepository):
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = f"""
-            SELECT t.id, t.incident_id, t.title, t.description, t.assigned_to,
+            SELECT t.id, t.incident_id, t.title, t.description,
                    ts.name AS status, t.result, t.created_by, t.created_at,
                    t.completed_at, t.due_date,
                    i.title AS incident_title, i.has_personal_data
@@ -1432,7 +1539,9 @@ class TaskRepository(_BaseRepository):
             ORDER BY t.id DESC
         """
         with self.db.connection() as conn:
-            return conn.execute(sql, params).fetchall()
+            rows = conn.execute(sql, params).fetchall()
+            assignees_map = self._load_assignees_map(conn, [r["id"] for r in rows])
+            return rows, assignees_map
 
     def list_filtered(
         self,
@@ -1442,13 +1551,13 @@ class TaskRepository(_BaseRepository):
         exclude_personal_data: bool = False,
     ) -> list[Task]:
         """List filtered tasks as domain Task objects."""
-        rows = self._query_filtered_rows(
+        rows, assignees_map = self._query_filtered_rows(
             assigned_to=assigned_to,
             status=status,
             incident_id=incident_id,
             exclude_personal_data=exclude_personal_data,
         )
-        return [_row_to_task(r) for r in rows]
+        return [_row_to_task(r, assignees_map.get(r["id"])) for r in rows]
 
     def list_filtered_with_meta(
         self,
@@ -1457,14 +1566,21 @@ class TaskRepository(_BaseRepository):
         incident_id: int | None = None,
         exclude_personal_data: bool = False,
     ) -> list[dict[str, Any]]:
-        """List filtered tasks enriched with incident_title and has_personal_data."""
-        rows = self._query_filtered_rows(
+        """List filtered tasks enriched with incident_title, has_personal_data, assigned_to, and assignee_ids."""
+        rows, assignees_map = self._query_filtered_rows(
             assigned_to=assigned_to,
             status=status,
             incident_id=incident_id,
             exclude_personal_data=exclude_personal_data,
         )
-        return [dict(r) for r in rows]
+        result: list[dict[str, Any]] = []
+        for r in rows:
+            item = dict(r)
+            item_ids = assignees_map.get(r["id"], [])
+            item["assignee_ids"] = item_ids
+            item["assigned_to"] = item_ids[0] if item_ids else None
+            result.append(item)
+        return result
 
     def create(
         self,
@@ -1476,42 +1592,57 @@ class TaskRepository(_BaseRepository):
         created_at: str | None = None,
         due_date: str | None = None,
         status: str = TaskStatus.OPEN.value,
+        assignee_ids: Iterable[int] | None = None,
     ) -> Task:
-        """Create a new task and return the persisted Task model."""
+        """Create a new task with up to MAX_TASK_ASSIGNEES assignees and return the Task model."""
         ts = created_at or utc_now()
+        effective_ids = self._resolve_assignee_ids(assigned_to, assignee_ids)
         with self.db.connection() as conn:
             status_id = _resolve_task_status_id(conn, status)
             cur = conn.execute(
                 """
                 INSERT INTO tasks (
-                    incident_id, title, description, assigned_to,
+                    incident_id, title, description,
                     status_id, result, created_by, created_at, due_date
-                ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, '', ?, ?, ?)
                 """,
-                (incident_id, title, description, assigned_to, status_id, created_by, ts, due_date),
+                (
+                    incident_id,
+                    title,
+                    description,
+                    status_id,
+                    created_by,
+                    ts,
+                    due_date,
+                ),
             )
+            task_id = int(cur.lastrowid)
+            self._sync_assignees(conn, task_id, effective_ids, ts)
             conn.commit()
             row = conn.execute(
                 f"{_TASK_SELECT_SQL} WHERE t.id = ?",
-                (cur.lastrowid,),
+                (task_id,),
             ).fetchone()
-            return _row_to_task(row)
+            return _row_to_task(row, effective_ids)
 
     def update(self, task: Task) -> Task:
-        """Persist task updates and return the reloaded Task model."""
+        """Persist task updates including task_assignees and return the reloaded Task model."""
+        effective_ids = self._resolve_assignee_ids(task.assigned_to, task.assignee_ids)
+        task.assignee_ids = effective_ids
+        task.assigned_to = effective_ids[0] if effective_ids else None
+        now = utc_now()
         with self.db.connection() as conn:
             status_id = _resolve_task_status_id(conn, task.status)
             conn.execute(
                 """
                 UPDATE tasks
-                SET title = ?, description = ?, assigned_to = ?,
+                SET title = ?, description = ?,
                     status_id = ?, result = ?, completed_at = ?, due_date = ?
                 WHERE id = ?
                 """,
                 (
                     task.title,
                     task.description,
-                    task.assigned_to,
                     status_id,
                     task.result,
                     task.completed_at,
@@ -1519,20 +1650,27 @@ class TaskRepository(_BaseRepository):
                     task.id,
                 ),
             )
+            self._sync_assignees(conn, task.id, effective_ids, now)
             conn.commit()
             row = conn.execute(
                 f"{_TASK_SELECT_SQL} WHERE t.id = ?",
                 (task.id,),
             ).fetchone()
-            return _row_to_task(row)
+            return _row_to_task(row, effective_ids)
 
 
-_NOTIFICATION_SELECT_SQL = """
-    SELECT n.id, n.incident_id, r.code AS recipient_role, n.recipient_name,
+_RECIPIENT_ROLE_EXPR = (
+    "COALESCE(r.code, CASE WHEN nc.name = 'telegram' THEN 'telegram' ELSE '' END)"
+)
+
+_NOTIFICATION_SELECT_SQL = f"""
+    SELECT n.id, n.incident_id,
+           {_RECIPIENT_ROLE_EXPR} AS recipient_role,
+           n.recipient_name,
            nk.code AS kind, n.message, n.created_at,
            nc.name AS channel, ds.name AS status
     FROM notifications n
-    JOIN roles r ON r.id = n.recipient_role_id
+    LEFT JOIN roles r ON r.id = n.recipient_role_id
     JOIN notification_kinds nk ON nk.id = n.kind_id
     JOIN notification_channels nc ON nc.id = n.channel_id
     JOIN delivery_statuses ds ON ds.id = n.status_id
@@ -1570,7 +1708,7 @@ class NotificationRepository(_BaseRepository):
         channel: str,
         status: str,
     ) -> Notification:
-        role_id = _resolve_role_id(conn, recipient_role)
+        role_id = _resolve_optional_role_id(conn, recipient_role)
         kind_id = get_or_create_code_id(conn, "notification_kinds", kind)
         channel_id = _resolve_channel_id(conn, channel)
         status_id = _resolve_delivery_status_id(conn, status)
@@ -1685,7 +1823,7 @@ class NotificationRepository(_BaseRepository):
         params: list[Any] = []
 
         if recipient_role and recipient_role.strip():
-            clauses.append("r.code = ?")
+            clauses.append(f"{_RECIPIENT_ROLE_EXPR} = ?")
             params.append(recipient_role.strip())
         if q and q.strip():
             clauses.append("(cfold(n.message) LIKE ? OR cfold(n.recipient_name) LIKE ?)")
@@ -1712,6 +1850,16 @@ class NotificationRepository(_BaseRepository):
         with self.db.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
             return [_row_to_notification(r) for r in rows]
+
+    def update_status(self, notification_id: int, status: DeliveryStatus | str) -> None:
+        """Update delivery status for an existing notification record."""
+        with self.db.connection() as conn:
+            status_id = _resolve_delivery_status_id(conn, status)
+            conn.execute(
+                "UPDATE notifications SET status_id = ? WHERE id = ?",
+                (status_id, notification_id),
+            )
+            conn.commit()
 
 
 _AUDIT_SELECT_SQL = """
@@ -1872,3 +2020,338 @@ class IngestionErrorRepository(_BaseRepository):
                 occurred_at=row["occurred_at"],
                 resolved=bool(row["resolved"]),
             )
+
+
+def _row_to_tg_settings(row: sqlite3.Row) -> TelegramSettings:
+    return TelegramSettings(
+        id=row["id"],
+        bot_token=row["bot_token"],
+        enabled=bool(row["enabled"]),
+        webhook_secret=row["webhook_secret"],
+        app_base_url=row["app_base_url"],
+        notify_on_create=bool(row["notify_on_create"]),
+        notify_on_status=bool(row["notify_on_status"]),
+        notify_on_escalation=bool(row["notify_on_escalation"]),
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_tg_subscription(row: sqlite3.Row) -> TelegramSubscription:
+    return TelegramSubscription(
+        id=row["id"],
+        chat_id=row["chat_id"],
+        label=row["label"],
+        role=row["role"],
+        min_severity=row["min_severity"],
+        notify_on_create=bool(row["notify_on_create"]),
+        notify_on_status=bool(row["notify_on_status"]),
+        notify_on_escalation=bool(row["notify_on_escalation"]),
+        include_pdn=bool(row["include_pdn"]),
+        active=bool(row["active"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+_TG_SUB_SELECT_SQL = """
+    SELECT ts.id, ts.chat_id, ts.label,
+           COALESCE(r.code, '') AS role,
+           sev.code AS min_severity,
+           ts.notify_on_create, ts.notify_on_status, ts.notify_on_escalation,
+           ts.include_pdn, ts.active, ts.created_at, ts.updated_at
+    FROM telegram_subscriptions ts
+    LEFT JOIN roles r ON r.id = ts.role_id
+    JOIN severities sev ON sev.id = ts.min_severity_id
+"""
+
+
+class TelegramRepository(_BaseRepository):
+    """Persistence operations for Telegram bot configuration and chat subscriptions."""
+
+    def get_settings(self) -> TelegramSettings:
+        """Fetch singleton Telegram configuration row or return defaults."""
+        with self.db.connection() as conn:
+            row = conn.execute("SELECT * FROM telegram_settings WHERE id = 1").fetchone()
+            if row is None:
+                return TelegramSettings()
+            return _row_to_tg_settings(row)
+
+    def save_settings(self, settings: TelegramSettings) -> TelegramSettings:
+        """Insert or update singleton Telegram configuration row."""
+        now = settings.updated_at or utc_now()
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO telegram_settings (
+                    id, bot_token, enabled, webhook_secret, app_base_url,
+                    notify_on_create, notify_on_status, notify_on_escalation, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    bot_token = excluded.bot_token,
+                    enabled = excluded.enabled,
+                    webhook_secret = excluded.webhook_secret,
+                    app_base_url = excluded.app_base_url,
+                    notify_on_create = excluded.notify_on_create,
+                    notify_on_status = excluded.notify_on_status,
+                    notify_on_escalation = excluded.notify_on_escalation,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    settings.bot_token,
+                    1 if settings.enabled else 0,
+                    settings.webhook_secret,
+                    settings.app_base_url,
+                    1 if settings.notify_on_create else 0,
+                    1 if settings.notify_on_status else 0,
+                    1 if settings.notify_on_escalation else 0,
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM telegram_settings WHERE id = 1").fetchone()
+            return _row_to_tg_settings(row)
+
+    def list_subscriptions(self, *, active_only: bool = False) -> list[TelegramSubscription]:
+        """List Telegram chat subscriptions ordered by ID."""
+        sql = _TG_SUB_SELECT_SQL
+        if active_only:
+            sql += " WHERE ts.active = 1"
+        sql += " ORDER BY ts.id ASC"
+        with self.db.connection() as conn:
+            rows = conn.execute(sql).fetchall()
+            return [_row_to_tg_subscription(r) for r in rows]
+
+    def get_subscription(self, sub_id: int) -> TelegramSubscription | None:
+        """Fetch a Telegram subscription by primary key ID."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                f"{_TG_SUB_SELECT_SQL} WHERE ts.id = ?",
+                (sub_id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row) if row is not None else None
+
+    def get_subscription_by_chat_id(self, chat_id: str) -> TelegramSubscription | None:
+        """Fetch a Telegram subscription by chat_id."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                f"{_TG_SUB_SELECT_SQL} WHERE ts.chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row) if row is not None else None
+
+    def upsert_subscription(self, sub: TelegramSubscription) -> TelegramSubscription:
+        """Create or update a subscription keyed by chat_id."""
+        now = sub.updated_at or utc_now()
+        created_at = sub.created_at or now
+        with self.db.connection() as conn:
+            role_id = _resolve_optional_role_id(conn, sub.role)
+            min_severity_id = _resolve_severity_id(conn, sub.min_severity or Severity.LOW.value)
+            if min_severity_id is None:
+                min_severity_id = _lookup_id(conn, "severities", "code", Severity.LOW.value)
+            conn.execute(
+                """
+                INSERT INTO telegram_subscriptions (
+                    chat_id, label, role_id, min_severity_id,
+                    notify_on_create, notify_on_status, notify_on_escalation,
+                    include_pdn, active, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    label = excluded.label,
+                    role_id = excluded.role_id,
+                    min_severity_id = excluded.min_severity_id,
+                    notify_on_create = excluded.notify_on_create,
+                    notify_on_status = excluded.notify_on_status,
+                    notify_on_escalation = excluded.notify_on_escalation,
+                    include_pdn = excluded.include_pdn,
+                    active = excluded.active,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    sub.chat_id,
+                    sub.label,
+                    role_id,
+                    min_severity_id,
+                    1 if sub.notify_on_create else 0,
+                    1 if sub.notify_on_status else 0,
+                    1 if sub.notify_on_escalation else 0,
+                    1 if sub.include_pdn else 0,
+                    1 if sub.active else 0,
+                    created_at,
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                f"{_TG_SUB_SELECT_SQL} WHERE ts.chat_id = ?",
+                (sub.chat_id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row)
+
+    def update_subscription(self, sub: TelegramSubscription) -> TelegramSubscription:
+        """Persist changes to an existing Telegram subscription."""
+        now = sub.updated_at or utc_now()
+        with self.db.connection() as conn:
+            role_id = _resolve_optional_role_id(conn, sub.role)
+            min_severity_id = _resolve_severity_id(conn, sub.min_severity or Severity.LOW.value)
+            if min_severity_id is None:
+                min_severity_id = _lookup_id(conn, "severities", "code", Severity.LOW.value)
+            conn.execute(
+                """
+                UPDATE telegram_subscriptions
+                SET label = ?, role_id = ?, min_severity_id = ?,
+                    notify_on_create = ?, notify_on_status = ?, notify_on_escalation = ?,
+                    include_pdn = ?, active = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    sub.label,
+                    role_id,
+                    min_severity_id,
+                    1 if sub.notify_on_create else 0,
+                    1 if sub.notify_on_status else 0,
+                    1 if sub.notify_on_escalation else 0,
+                    1 if sub.include_pdn else 0,
+                    1 if sub.active else 0,
+                    now,
+                    sub.id,
+                ),
+            )
+            conn.commit()
+            row = conn.execute(
+                f"{_TG_SUB_SELECT_SQL} WHERE ts.id = ?",
+                (sub.id,),
+            ).fetchone()
+            return _row_to_tg_subscription(row)
+
+    def delete_subscription(self, sub_id: int) -> bool:
+        """Delete a Telegram subscription by ID."""
+        with self.db.connection() as conn:
+            cur = conn.execute("DELETE FROM telegram_subscriptions WHERE id = ?", (sub_id,))
+            conn.commit()
+            return cur.rowcount > 0
+
+
+_ATTACHMENT_SELECT_SQL = """
+    SELECT a.id, a.incident_id, a.task_id, a.filename,
+           mt.code AS mime_type, a.path, a.size_bytes,
+           a.uploaded_by, a.uploaded_at
+    FROM attachments a
+    JOIN mime_types mt ON mt.id = a.mime_type_id
+"""
+
+
+class AttachmentRepository(_BaseRepository):
+    """Persistence operations for incident and task file attachments."""
+
+    def get_by_id(self, attachment_id: int) -> Attachment | None:
+        """Fetch an attachment metadata record by primary key."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                f"{_ATTACHMENT_SELECT_SQL} WHERE a.id = ?",
+                (attachment_id,),
+            ).fetchone()
+            return _row_to_attachment(row) if row is not None else None
+
+    def list_by_incident(
+        self,
+        incident_id: int,
+        task_id: int | None = None,
+    ) -> list[Attachment]:
+        """List attachments belonging to an incident, optionally filtered by task_id."""
+        with self.db.connection() as conn:
+            if task_id is not None:
+                rows = conn.execute(
+                    f"{_ATTACHMENT_SELECT_SQL} WHERE a.incident_id = ? AND a.task_id = ? ORDER BY a.id ASC",
+                    (incident_id, task_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"{_ATTACHMENT_SELECT_SQL} WHERE a.incident_id = ? ORDER BY a.id ASC",
+                    (incident_id,),
+                ).fetchall()
+            return [_row_to_attachment(r) for r in rows]
+
+    def list_by_task(self, task_id: int) -> list[Attachment]:
+        """List attachments currently linked to a task."""
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                f"{_ATTACHMENT_SELECT_SQL} WHERE a.task_id = ? ORDER BY a.id ASC",
+                (task_id,),
+            ).fetchall()
+            return [_row_to_attachment(r) for r in rows]
+
+    def list_by_task_ids(self, task_ids: Iterable[int]) -> dict[int, list[Attachment]]:
+        """Batch-fetch attachments grouped by task_id."""
+        unique_ids = sorted({int(tid) for tid in task_ids if tid is not None})
+        if not unique_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                f"{_ATTACHMENT_SELECT_SQL} WHERE a.task_id IN ({placeholders}) ORDER BY a.id ASC",
+                unique_ids,
+            ).fetchall()
+        grouped: dict[int, list[Attachment]] = {}
+        for row in rows:
+            att = _row_to_attachment(row)
+            if att.task_id is not None:
+                grouped.setdefault(att.task_id, []).append(att)
+        return grouped
+
+    def create(
+        self,
+        incident_id: int,
+        filename: str,
+        mime_type: str,
+        path: str,
+        size_bytes: int,
+        uploaded_by: int | None,
+        uploaded_at: str | None = None,
+        task_id: int | None = None,
+    ) -> Attachment:
+        """Insert a new attachment metadata record and return the persisted model."""
+        ts = uploaded_at or utc_now()
+        with self.db.connection() as conn:
+            mime_type_id = get_or_create_code_id(conn, "mime_types", mime_type)
+            cur = conn.execute(
+                """
+                INSERT INTO attachments (
+                    incident_id, task_id, filename, mime_type_id, path,
+                    size_bytes, uploaded_by, uploaded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (incident_id, task_id, filename, mime_type_id, path, size_bytes, uploaded_by, ts),
+            )
+            conn.commit()
+            row = conn.execute(
+                f"{_ATTACHMENT_SELECT_SQL} WHERE a.id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+            return _row_to_attachment(row)
+
+    def update_task_id(self, attachment_id: int, task_id: int | None) -> Attachment | None:
+        """Link an attachment to a task or detach it (task_id=None)."""
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE attachments SET task_id = ? WHERE id = ?",
+                (task_id, attachment_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                f"{_ATTACHMENT_SELECT_SQL} WHERE a.id = ?",
+                (attachment_id,),
+            ).fetchone()
+            return _row_to_attachment(row) if row is not None else None
+
+    def delete(self, attachment_id: int) -> Attachment | None:
+        """Delete an attachment metadata record and return the deleted model."""
+        with self.db.connection() as conn:
+            row = conn.execute(
+                f"{_ATTACHMENT_SELECT_SQL} WHERE a.id = ?",
+                (attachment_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute("DELETE FROM attachments WHERE id = ?", (attachment_id,))
+            conn.commit()
+            return _row_to_attachment(row)

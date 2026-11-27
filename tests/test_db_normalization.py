@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from app.container import AppContainer
-from app.domain.models import Incident
+from app.domain.models import Incident, TelegramSubscription
 from app.enums import (
     AccessCategory,
     Channel,
@@ -394,6 +394,133 @@ class TestNormalizedDatabaseSchema(unittest.TestCase):
                     "SELECT instruction_step_id FROM step_progress WHERE incident_id = 10 AND step_index = 1"
                 ).fetchone()
                 self.assertIsNotNone(prog_row["instruction_step_id"])
+
+    def test_merged_features_normalization_and_main_migration(self) -> None:
+        # 1. Verify attachments (mime_types FK), telegram_subscriptions (role_id + min_severity_id),
+        #    and tasks (task_assignees without redundant tasks.assigned_to column).
+        att = self.container.attachment_repo.create(
+            incident_id=1,
+            filename="evidence.png",
+            mime_type="image/png",
+            path="incident_1/evidence.png",
+            size_bytes=128,
+            uploaded_by=1,
+        )
+        self.assertEqual(att.mime_type, "image/png")
+
+        sub = self.container.telegram_repo.upsert_subscription(
+            TelegramSubscription(
+                id=0,
+                chat_id="-100777",
+                label="SOC",
+                role=Role.SECURITY_SPECIALIST.value,
+                min_severity=Severity.HIGH.value,
+            )
+        )
+        self.assertEqual(sub.role, Role.SECURITY_SPECIALIST.value)
+        self.assertEqual(sub.min_severity, Severity.HIGH.value)
+
+        with self.container.db.connection() as conn:
+            att_row = conn.execute(
+                "SELECT mime_type_id FROM attachments WHERE id = ?", (att.id,)
+            ).fetchone()
+            self.assertIsNotNone(att_row["mime_type_id"])
+
+            sub_row = conn.execute(
+                "SELECT role_id, min_severity_id FROM telegram_subscriptions WHERE id = ?",
+                (sub.id,),
+            ).fetchone()
+            self.assertIsNotNone(sub_row["role_id"])
+            self.assertIsNotNone(sub_row["min_severity_id"])
+
+            task_cols = {
+                r["name"] for r in conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            self.assertNotIn("assigned_to", task_cols)
+
+        # 2. Migrate a pre-normalization DB matching origin/main (with task_assignees, attachments, telegram_*)
+        with tempfile.TemporaryDirectory() as tmp:
+            main_db = str(Path(tmp) / "main_pre_norm.db")
+            conn = sqlite3.connect(main_db)
+            conn.executescript(
+                """
+                CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, full_name TEXT NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
+                CREATE TABLE sessions (token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE instructions (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, incident_type TEXT NOT NULL, steps_json TEXT NOT NULL);
+                CREATE TABLE incidents (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', incident_type TEXT NOT NULL, severity TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Новый', outcome TEXT NOT NULL DEFAULT '', computer TEXT NOT NULL DEFAULT '', employee TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '', incident_key TEXT NOT NULL DEFAULT '', has_personal_data INTEGER NOT NULL DEFAULT 0, instruction_id INTEGER, rkn_draft TEXT NOT NULL DEFAULT '', detected_at TEXT NOT NULL, taken_at TEXT, closed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, access_category TEXT NOT NULL DEFAULT '', assigned_to INTEGER, rkn_sent_at TEXT, rkn_confirmation TEXT NOT NULL DEFAULT '');
+                CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, source TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', body TEXT NOT NULL, incident_key TEXT NOT NULL DEFAULT '', received_at TEXT NOT NULL);
+                CREATE TABLE history (id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, user_id INTEGER, action TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+                CREATE TABLE step_progress (incident_id INTEGER NOT NULL, step_index INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0, updated_by INTEGER, updated_at TEXT NOT NULL, PRIMARY KEY (incident_id, step_index));
+                CREATE TABLE tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', assigned_to INTEGER, status TEXT NOT NULL DEFAULT 'Открыта', result TEXT NOT NULL DEFAULT '', created_by INTEGER, created_at TEXT NOT NULL, completed_at TEXT, due_date TEXT);
+                CREATE TABLE task_assignees (task_id INTEGER NOT NULL, user_id INTEGER NOT NULL, position INTEGER NOT NULL DEFAULT 0, assigned_at TEXT NOT NULL, PRIMARY KEY (task_id, user_id));
+                CREATE TABLE attachments (id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, task_id INTEGER, filename TEXT NOT NULL, mime_type TEXT NOT NULL, path TEXT NOT NULL, size_bytes INTEGER NOT NULL DEFAULT 0, uploaded_by INTEGER, uploaded_at TEXT NOT NULL);
+                CREATE TABLE notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER, recipient_role TEXT NOT NULL, recipient_name TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL, created_at TEXT NOT NULL, channel TEXT NOT NULL DEFAULT 'internal', status TEXT NOT NULL DEFAULT 'sent');
+                CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, object_type TEXT NOT NULL, object_id INTEGER, action TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE ingestion_errors (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL DEFAULT '', error_text TEXT NOT NULL, occurred_at TEXT NOT NULL, resolved INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE telegram_settings (id INTEGER PRIMARY KEY CHECK (id = 1), bot_token TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, webhook_secret TEXT NOT NULL DEFAULT '', app_base_url TEXT NOT NULL DEFAULT '', notify_on_create INTEGER NOT NULL DEFAULT 1, notify_on_status INTEGER NOT NULL DEFAULT 1, notify_on_escalation INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT '');
+                CREATE TABLE telegram_subscriptions (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT UNIQUE NOT NULL, label TEXT NOT NULL DEFAULT '', role TEXT NOT NULL DEFAULT '', min_severity TEXT NOT NULL DEFAULT 'low', notify_on_create INTEGER NOT NULL DEFAULT 1, notify_on_status INTEGER NOT NULL DEFAULT 1, notify_on_escalation INTEGER NOT NULL DEFAULT 1, include_pdn INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                """
+            )
+            conn.execute(
+                "INSERT INTO users (id, username, password_hash, full_name, role, active) VALUES (1, 'ib', ?, 'ИБ', 'ib_specialist', 1)",
+                (hash_password("password123"),),
+            )
+            conn.execute(
+                "INSERT INTO users (id, username, password_hash, full_name, role, active) VALUES (2, 'sysadmin', ?, 'Сисадмин', 'sysadmin', 1)",
+                (hash_password("password123"),),
+            )
+            conn.execute(
+                "INSERT INTO incidents (id, title, incident_type, severity, status, detected_at, created_at, updated_at) VALUES (1, 'Inc', 'Вирус / Вредоносное ПО', 'high', 'Новый', '2026-11-25T10:00:00+00:00', '2026-11-25T10:00:00+00:00', '2026-11-25T10:00:00+00:00')"
+            )
+            conn.execute(
+                "INSERT INTO tasks (id, incident_id, title, assigned_to, status, created_by, created_at) VALUES (3, 1, 'MultiTask', 2, 'Открыта', 1, '2026-11-25T10:05:00+00:00')"
+            )
+            conn.execute(
+                "INSERT INTO task_assignees (task_id, user_id, position, assigned_at) VALUES (3, 2, 0, '2026-11-25T10:05:00+00:00'), (3, 1, 1, '2026-11-25T10:05:00+00:00')"
+            )
+            conn.execute(
+                "INSERT INTO attachments (id, incident_id, task_id, filename, mime_type, path, size_bytes, uploaded_by, uploaded_at) VALUES (5, 1, 3, 'log.txt', 'text/plain', 'incident_1/log.txt', 42, 1, '2026-11-25T10:06:00+00:00')"
+            )
+            conn.execute(
+                "INSERT INTO notifications (id, incident_id, recipient_role, recipient_name, kind, message, created_at, channel, status) VALUES (9, 1, 'telegram', 'All Chat', 'tg_incident_created', 'New inc', '2026-11-25T10:07:00+00:00', 'telegram', 'sent')"
+            )
+            conn.execute(
+                "INSERT INTO telegram_settings (id, bot_token, enabled, updated_at) VALUES (1, '123:TOK', 1, '2026-11-25T10:00:00+00:00')"
+            )
+            conn.execute(
+                "INSERT INTO telegram_subscriptions (id, chat_id, label, role, min_severity, include_pdn, active, created_at, updated_at) VALUES (1, '-1001', 'General', '', 'medium', 0, 1, '2026-11-25T10:00:00+00:00', '2026-11-25T10:00:00+00:00')"
+            )
+            conn.commit()
+            conn.close()
+
+            db = Database(main_db)
+            db.init_schema()
+            db.init_schema()
+
+            c = AppContainer(db_path=main_db)
+            task = c.task_repo.get_by_id(3)
+            self.assertIsNotNone(task)
+            self.assertEqual(task.assignee_ids, [2, 1])
+            self.assertEqual(task.assigned_to, 2)
+
+            atts = c.attachment_repo.list_by_task(3)
+            self.assertEqual(len(atts), 1)
+            self.assertEqual(atts[0].mime_type, "text/plain")
+            self.assertEqual(atts[0].size_bytes, 42)
+
+            cfg = c.telegram_repo.get_settings()
+            self.assertEqual(cfg.bot_token, "123:TOK")
+            subs = c.telegram_repo.list_subscriptions()
+            self.assertEqual(len(subs), 1)
+            self.assertEqual(subs[0].role, "")
+            self.assertEqual(subs[0].min_severity, Severity.MEDIUM.value)
+
+            tg_notifs = c.notification_repo.list_all(recipient_role="telegram")
+            self.assertEqual(len(tg_notifs), 1)
+            self.assertEqual(tg_notifs[0].channel, Channel.TELEGRAM.value)
+
+            with db.connection() as check_conn:
+                self.assertEqual(check_conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
 
 if __name__ == "__main__":
