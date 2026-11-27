@@ -22,6 +22,7 @@ from app.services.ops import (
     ReportService,
     TaskService,
 )
+from app.services.telegram import TelegramNotificationService
 from app.services.users import UserService
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "ReportService",
     "ServiceError",
     "TaskService",
+    "TelegramNotificationService",
     "UnauthorizedError",
     "UserService",
     "ValidationError",

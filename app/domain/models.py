@@ -626,3 +626,94 @@ class ReportFile:
             "created_at": self.created_at,
             "data": dict(self.data),
         }
+
+
+def _mask_secret(value: str) -> str:
+    """Return a safe masked representation of a secret token."""
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= 10:
+        return "***"
+    return f"{cleaned[:6]}...{cleaned[-4:]}"
+
+
+@dataclass
+class TelegramSettings:
+    """Runtime configuration for Telegram bot incident notifications."""
+
+    id: int = 1
+    bot_token: str = ""
+    enabled: bool = True
+    webhook_secret: str = ""
+    app_base_url: str = ""
+    notify_on_create: bool = True
+    notify_on_status: bool = True
+    notify_on_escalation: bool = True
+    updated_at: str = ""
+
+    def __post_init__(self) -> None:
+        self.enabled = bool(self.enabled)
+        self.notify_on_create = bool(self.notify_on_create)
+        self.notify_on_status = bool(self.notify_on_status)
+        self.notify_on_escalation = bool(self.notify_on_escalation)
+
+    def to_dict(self, *, mask_secrets: bool = True) -> dict[str, Any]:
+        """Serialize Telegram settings safely, masking tokens by default."""
+        return {
+            "id": self.id,
+            "enabled": self.enabled,
+            "has_token": bool(self.bot_token.strip()),
+            "bot_token": _mask_secret(self.bot_token) if mask_secrets else self.bot_token,
+            "has_webhook_secret": bool(self.webhook_secret.strip()),
+            "webhook_secret": (
+                _mask_secret(self.webhook_secret) if mask_secrets else self.webhook_secret
+            ),
+            "app_base_url": self.app_base_url,
+            "notify_on_create": self.notify_on_create,
+            "notify_on_status": self.notify_on_status,
+            "notify_on_escalation": self.notify_on_escalation,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass
+class TelegramSubscription:
+    """Telegram chat subscription with role-based and severity filters."""
+
+    id: int
+    chat_id: str
+    label: str = ""
+    role: str = ""
+    min_severity: str = Severity.LOW.value
+    notify_on_create: bool = True
+    notify_on_status: bool = True
+    notify_on_escalation: bool = True
+    include_pdn: bool = False
+    active: bool = True
+    created_at: str = ""
+    updated_at: str = ""
+
+    def __post_init__(self) -> None:
+        self.notify_on_create = bool(self.notify_on_create)
+        self.notify_on_status = bool(self.notify_on_status)
+        self.notify_on_escalation = bool(self.notify_on_escalation)
+        self.include_pdn = bool(self.include_pdn)
+        self.active = bool(self.active)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize subscription fields to a plain dictionary."""
+        return {
+            "id": self.id,
+            "chat_id": self.chat_id,
+            "label": self.label,
+            "role": self.role,
+            "min_severity": self.min_severity,
+            "notify_on_create": self.notify_on_create,
+            "notify_on_status": self.notify_on_status,
+            "notify_on_escalation": self.notify_on_escalation,
+            "include_pdn": self.include_pdn,
+            "active": self.active,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }

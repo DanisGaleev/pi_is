@@ -1,5 +1,5 @@
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from app.domain.models import Incident, User
 from app.enums import (
@@ -40,6 +40,9 @@ from app.services.exceptions import (
 from app.services.ops import NotificationService
 from app.services.users import enrich_tasks_with_users
 from app.services.validators import require_non_blank, require_non_blank_enum_input
+
+if TYPE_CHECKING:
+    from app.services.telegram import TelegramNotificationService
 
 
 def normalize_outcome(raw: str | CheckResult | None) -> str | None:
@@ -188,6 +191,7 @@ class IngestionService:
         dispatcher: IncidentDispatcher | None = None,
         user_repo: UserRepository | None = None,
         notification_service: NotificationService | None = None,
+        telegram_service: "TelegramNotificationService | None" = None,
     ) -> None:
         self.incident_repo = incident_repo
         self.message_repo = message_repo
@@ -200,6 +204,7 @@ class IngestionService:
         self.dispatcher = dispatcher if dispatcher is not None else IncidentDispatcher()
         self.user_repo = user_repo
         self.notification_service = notification_service
+        self.telegram_service = telegram_service
 
     def receive(self, signal_data: dict[str, Any]) -> dict[str, Any]:
         """Normalize an external signal, classify & dispatch, deduplicate or create incident."""
@@ -325,6 +330,8 @@ class IngestionService:
         )
         self._emit_urgent_notifications(created, classified_type, severity)
         self._notify_telegram_reply(source_enum, signal_data, created.id)
+        if self.telegram_service is not None:
+            self.telegram_service.notify_incident_created(created)
         return {
             "incident_id": created.id,
             "deduplicated": False,
@@ -434,6 +441,8 @@ class IngestionService:
             created_at=now,
         )
         self.access_control.log_access(actor.id, "incident", created.id, "create")
+        if self.telegram_service is not None:
+            self.telegram_service.notify_incident_created(created)
         return created.to_dict()
 
 
@@ -450,6 +459,7 @@ class IncidentService:
         access_control: AccessControlService,
         ingestion_service: IngestionService,
         user_repo: UserRepository | None = None,
+        telegram_service: "TelegramNotificationService | None" = None,
         attachment_repo: AttachmentRepository | None = None,
     ) -> None:
         self.incident_repo = incident_repo
@@ -460,6 +470,7 @@ class IncidentService:
         self.access_control = access_control
         self.ingestion_service = ingestion_service
         self.user_repo = user_repo or UserRepository(task_repo.db)
+        self.telegram_service = telegram_service
         self.attachment_repo = attachment_repo or AttachmentRepository(task_repo.db)
 
     def list_incidents(
@@ -671,6 +682,8 @@ class IncidentService:
             created_at=now,
         )
         self.access_control.log_access(actor.id, "incident", incident_id, "status_change")
+        if self.telegram_service is not None:
+            self.telegram_service.notify_status_changed(updated, old_status, actor=actor)
         return updated.to_dict()
 
     def classify(
